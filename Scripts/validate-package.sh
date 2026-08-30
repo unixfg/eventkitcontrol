@@ -145,6 +145,7 @@ PY
 
 echo "Validating product distribution constraints..."
 python3 - "$DISTRIBUTION_PATH" "$REFERENCE_VERSION" <<'PY'
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -292,10 +293,10 @@ if package_attributes.get("onConclusion", "").lower() != "none":
 if "auth" in package_attributes and package_attributes["auth"].lower() != "root":
     fail("Distribution package reference must require root authorization when auth is present")
 install_kbytes = package_attributes.get("installKBytes")
-if install_kbytes is None or not install_kbytes.isdigit() or int(install_kbytes) <= 0:
+if install_kbytes is None or re.fullmatch(r"[0-9]+", install_kbytes) is None or int(install_kbytes) <= 0:
     fail("Distribution package reference has an invalid installKBytes value")
 update_kbytes = package_attributes.get("updateKBytes")
-if update_kbytes is not None and not update_kbytes.isdigit():
+if update_kbytes is not None and re.fullmatch(r"[0-9]+", update_kbytes) is None:
     fail("Distribution package reference has an invalid updateKBytes value")
 if package_locations != ["#eventkitcontrol-component.pkg"]:
     fail("Distribution package reference does not point to the embedded component")
