@@ -238,35 +238,63 @@ if list(choice_ref) or (choice_ref.text or "").strip():
     fail("Distribution choice package reference must not contain content")
 
 package_refs = root.findall("pkg-ref")
-if len(package_refs) != 1:
-    fail(f"Distribution must contain exactly one top-level package reference; found {len(package_refs)}")
-package_ref = package_refs[0]
+if not package_refs:
+    fail("Distribution must contain a top-level package reference")
+
+# productbuild may split one logical package reference across multiple
+# top-level pkg-ref elements with the same ID. Distribution semantics collapse
+# their attributes together; exactly one element supplies the package URL.
+allowed_package_attributes = {
+    "id",
+    "version",
+    "auth",
+    "installKBytes",
+    "onConclusion",
+}
+package_attributes = {}
+package_locations = []
+for package_ref in package_refs:
+    if package_ref.attrib.get("id") != "io.github.unixfg.eventkitcontrol.pkg":
+        fail("Distribution contains a package reference with the wrong identifier")
+    if list(package_ref):
+        fail("Distribution package reference unexpectedly contains child elements")
+
+    extra_package_attributes = set(package_ref.attrib) - allowed_package_attributes
+    if extra_package_attributes:
+        fail(
+            "Distribution package reference has unexpected attributes: "
+            f"{sorted(extra_package_attributes)!r}"
+        )
+
+    for key, value in package_ref.attrib.items():
+        previous = package_attributes.get(key)
+        if previous is not None and previous != value:
+            fail(f"Distribution package reference has conflicting {key} attributes")
+        package_attributes[key] = value
+
+    location = (package_ref.text or "").strip()
+    if location:
+        package_locations.append(location)
+
 required_package_attributes = {
     "id": "io.github.unixfg.eventkitcontrol.pkg",
     "version": expected_version,
 }
 for key, value in required_package_attributes.items():
-    if package_ref.attrib.get(key) != value:
-        fail(f"Distribution package reference {key} is {package_ref.attrib.get(key)!r}; expected {value!r}")
-if package_ref.attrib.get("onConclusion", "").lower() != "none":
+    if package_attributes.get(key) != value:
+        fail(
+            f"Distribution package reference {key} is "
+            f"{package_attributes.get(key)!r}; expected {value!r}"
+        )
+if package_attributes.get("onConclusion", "").lower() != "none":
     fail("Distribution package reference must not require logout, restart, or shutdown")
-allowed_package_attributes = set(required_package_attributes) | {
-    "auth",
-    "installKBytes",
-    "onConclusion",
-}
-extra_package_attributes = set(package_ref.attrib) - allowed_package_attributes
-if extra_package_attributes:
-    fail(f"Distribution package reference has unexpected attributes: {sorted(extra_package_attributes)!r}")
-if "auth" in package_ref.attrib and package_ref.attrib["auth"].lower() != "root":
+if "auth" in package_attributes and package_attributes["auth"].lower() != "root":
     fail("Distribution package reference must require root authorization when auth is present")
-install_kbytes = package_ref.attrib.get("installKBytes")
+install_kbytes = package_attributes.get("installKBytes")
 if install_kbytes is None or not install_kbytes.isdigit() or int(install_kbytes) <= 0:
     fail("Distribution package reference has an invalid installKBytes value")
-if (package_ref.text or "").strip() != "#eventkitcontrol-component.pkg":
+if package_locations != ["#eventkitcontrol-component.pkg"]:
     fail("Distribution package reference does not point to the embedded component")
-if list(package_ref):
-    fail("Distribution package reference unexpectedly contains child elements")
 
 products = root.findall("product")
 if len(products) > 1:
