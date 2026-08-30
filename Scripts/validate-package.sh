@@ -249,6 +249,7 @@ allowed_package_attributes = {
     "version",
     "auth",
     "installKBytes",
+    "updateKBytes",
     "onConclusion",
 }
 package_attributes = {}
@@ -293,6 +294,9 @@ if "auth" in package_attributes and package_attributes["auth"].lower() != "root"
 install_kbytes = package_attributes.get("installKBytes")
 if install_kbytes is None or not install_kbytes.isdigit() or int(install_kbytes) <= 0:
     fail("Distribution package reference has an invalid installKBytes value")
+update_kbytes = package_attributes.get("updateKBytes")
+if update_kbytes is not None and not update_kbytes.isdigit():
+    fail("Distribution package reference has an invalid updateKBytes value")
 if package_locations != ["#eventkitcontrol-component.pkg"]:
     fail("Distribution package reference does not point to the embedded component")
 
