@@ -2,7 +2,7 @@ import ArgumentParser
 import Darwin
 import EventKit
 import Foundation
-import ekctlCore
+import EventKitControlCore
 
 // MARK: - Shared command safety
 
@@ -10,7 +10,7 @@ private let invalidInputExit: Int32 = 64
 
 private func writeStderr(_ value: String) {
     guard let data = (value + "\n").data(using: .utf8) else { return }
-    FileHandle.standardError.write(data)
+    try? FileHandle.standardError.write(contentsOf: data)
 }
 
 /// The only path used to render operation results. Failures go to stderr and
@@ -259,11 +259,11 @@ struct OccurrenceOptions: ParsableArguments {
 // MARK: - Main command
 
 @main
-struct Ekctl: ParsableCommand {
+struct EventKitControl: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "ekctl",
+        commandName: "eventkitcontrol",
         abstract: "Safely manage macOS Calendar events and Reminders using EventKit.",
-        version: "1.5.0",
+        version: "1.0.0",
         subcommands: [
             List.self, Show.self, Add.self, Update.self, Delete.self, Complete.self,
             Alias.self, CalendarCmd.self, Today.self, Tomorrow.self, Next.self,
@@ -370,7 +370,7 @@ struct ListEvents: ParsableCommand {
         }
         let calendarIDs: [String]
         do {
-            calendarIDs = try ConfigManager.resolveCalendarIDsThrowing(calendar)
+            calendarIDs = try ConfigManager.resolveCalendarIDs(calendar)
         } catch {
             try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
         }
@@ -399,7 +399,7 @@ struct ListReminders: ParsableCommand {
     func run() throws {
         let listID: String
         do {
-            listID = try ConfigManager.resolveAliasThrowing(list)
+            listID = try ConfigManager.resolveAlias(list)
         } catch {
             try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
         }
@@ -533,7 +533,7 @@ struct AddEvent: ParsableCommand {
         }
         let calendarID: String
         do {
-            calendarID = try ConfigManager.resolveAliasThrowing(calendar)
+            calendarID = try ConfigManager.resolveAlias(calendar)
         } catch {
             try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
         }
@@ -589,7 +589,7 @@ struct AddReminder: ParsableCommand {
             priority, default: 0, format: outputFormat.format) ?? 0
         let listID: String
         do {
-            listID = try ConfigManager.resolveAliasThrowing(list)
+            listID = try ConfigManager.resolveAlias(list)
         } catch {
             try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
         }
@@ -751,7 +751,7 @@ struct CalendarCmd: ParsableCommand {
 
 struct CreateCalendar: ParsableCommand {
     static let configuration = CommandConfiguration(commandName: "create")
-    @Option(name: .long, help: "Exact source ID from `ekctl list sources`.") var source: String
+    @Option(name: .long, help: "Exact source ID from `eventkitcontrol list sources`.") var source: String
     @Option(name: .long) var title: String
     @Option(name: .long, help: "Exact #RRGGBB color.") var color: String?
     @OptionGroup var mutation: MutationOptions
@@ -790,7 +790,7 @@ struct UpdateCalendar: ParsableCommand {
         try validateColor(color, format: outputFormat.format)
         let resolvedID: String
         do {
-            resolvedID = try ConfigManager.resolveAliasThrowing(calendarID)
+            resolvedID = try ConfigManager.resolveAlias(calendarID)
         } catch {
             try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
         }
@@ -819,7 +819,7 @@ struct DeleteCalendar: ParsableCommand {
     func run() throws {
         let resolvedID: String
         do {
-            resolvedID = try ConfigManager.resolveAliasThrowing(calendarID)
+            resolvedID = try ConfigManager.resolveAlias(calendarID)
         } catch {
             try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
         }
@@ -931,7 +931,7 @@ struct AliasSet: ParsableCommand {
             // A dry run must validate the same existing config state that the
             // real read-modify-write operation depends on. This read is
             // side-effect-free and also provides an accurate before value.
-            let aliases = try ConfigManager.getAliasesThrowing()
+            let aliases = try ConfigManager.getAliases()
             if !mutation.dryRun { try ConfigManager.setAlias(name: name, id: id) }
             try emit(
                 .success([
@@ -966,7 +966,7 @@ struct AliasRemove: ParsableCommand {
     func run() throws {
         do {
             try ConfigManager.validateAliasName(name)
-            let aliases = try ConfigManager.getAliasesThrowing()
+            let aliases = try ConfigManager.getAliases()
             guard aliases[name] != nil else {
                 try operationFailed("Alias '\(name)' was not found.", format: outputFormat.format)
             }
@@ -999,7 +999,7 @@ struct AliasList: ParsableCommand {
 
     func run() throws {
         do {
-            let aliases = try ConfigManager.getAliasesThrowing()
+            let aliases = try ConfigManager.getAliases()
             let rows = aliases.sorted(by: { $0.key < $1.key }).map {
                 ["name": $0.key, "id": $0.value]
             }
@@ -1007,7 +1007,7 @@ struct AliasList: ParsableCommand {
                 .success([
                     "aliases": rows,
                     "count": rows.count,
-                    "configPath": ConfigManager.configPath(),
+                    "configPath": try ConfigManager.configPath(),
                 ]),
                 format: outputFormat.format)
         } catch let code as ExitCode {
@@ -1030,7 +1030,7 @@ private func listQuickRange(
 ) throws {
     let calendarIDs: [String]
     do {
-        calendarIDs = try ConfigManager.resolveCalendarIDsThrowing(calendar)
+        calendarIDs = try ConfigManager.resolveCalendarIDs(calendar)
     } catch {
         try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
     }
@@ -1107,7 +1107,7 @@ struct Next: ParsableCommand {
         }
         let calendarIDs: [String]
         do {
-            calendarIDs = try ConfigManager.resolveCalendarIDsThrowing(calendar)
+            calendarIDs = try ConfigManager.resolveCalendarIDs(calendar)
         } catch {
             try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
         }

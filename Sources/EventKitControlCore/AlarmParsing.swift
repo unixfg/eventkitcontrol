@@ -29,13 +29,6 @@ public enum AlarmParsing {
         pattern: #"^[+-]?[0-9]+(?:\.[0-9]+)?$"#
     )
 
-    /// Compatibility convenience. CLI code should use `parseRequired` for a
-    /// useful validation error when a non-nil option is malformed.
-    public static func parse(_ string: String?) -> [Double]? {
-        guard let string else { return nil }
-        return try? parseRequired(string)
-    }
-
     public static func parseRequired(_ string: String) throws -> [Double] {
         guard !string.isEmpty else { throw AlarmParsingError.empty }
         let rawParts = string.split(separator: ",", omittingEmptySubsequences: false)

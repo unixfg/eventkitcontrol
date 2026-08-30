@@ -93,10 +93,9 @@ public enum OutputFormat: String, CaseIterable, ExpressibleByArgument {
 
 // MARK: - TimeFormat
 
-/// How timestamps are rendered in output (issue #3). The default stays
-/// RFC 3339 so existing consumers are untouched; `compact` is the opt-in
-/// jq-friendly form, since jq's `strptime` can parse `%z` (`+1100`) but not
-/// the colon-separated `%:z` (`+11:00`).
+/// How timestamps are rendered in output. RFC 3339 is the default; `compact`
+/// is the opt-in jq-friendly form, since jq's `strptime` can parse `%z`
+/// (`+1100`) but not the colon-separated `%:z` (`+11:00`).
 public enum TimeFormat: String, CaseIterable, ExpressibleByArgument {
     /// Colon-separated offset, `Z` for UTC: `2026-03-09T16:00:00+11:00`.
     case rfc3339
@@ -359,10 +358,4 @@ enum OutputFormatter {
         }
         return s
     }
-}
-
-// MARK: - ExitCode Extension
-
-public extension ExitCode {
-    static let permissionDenied = ExitCode(rawValue: 2)
 }

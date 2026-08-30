@@ -2,6 +2,7 @@ import CoreGraphics
 import CoreLocation
 import EventKit
 import Foundation
+import MapKit
 
 /// EventKitManager handles all interactions with the EventKit framework.
 ///
@@ -10,13 +11,12 @@ import Foundation
 /// On macOS, command-line tools require special setup to access Calendar and Reminders:
 ///
 /// 1. The tool must be code-signed with appropriate entitlements
-/// 2. An Info.plist must include privacy usage descriptions:
-///    - NSCalendarsUsageDescription: Explains why calendar access is needed
-///    - NSRemindersUsageDescription: Explains why reminders access is needed
+/// 2. The embedded Info.plist must include the full-access Calendar and
+///    Reminders usage descriptions required on macOS 14 and later.
 ///
-/// 3. For development, you can embed the Info.plist:
-///    - Add to Package.swift target: linkerSettings: [.unsafeFlags(["-sectcreate", "__TEXT", "__info_plist", "Info.plist"])]
-///    - Or sign the binary: codesign --entitlements entitlements.plist -s - ekctl
+/// 3. Package.swift embeds Info.plist in `__TEXT,__info_plist`;
+///    Scripts/build-artifact.sh signs the resulting binary with Hardened Runtime
+///    and the EventKit entitlements.
 ///
 /// 4. The first time the tool runs, macOS will prompt the user to grant access.
 ///    If denied, all operations will fail with a permission error.
@@ -28,15 +28,23 @@ import Foundation
 /// narrowest scope they can: a reminders-only workflow never triggers the
 /// Calendar prompt, and a denied-but-unneeded permission no longer produces
 /// confusing downstream "not found" errors.
-public enum AccessScope {
+public enum AccessScope: Sendable {
     case events
     case reminders
-    /// Requests both stores. Proceeds when at least one side is granted so a
-    /// caller can explicitly implement a partial-access read workflow.
-    case all
 
-    var includesEvents: Bool { self != .reminders }
-    var includesReminders: Bool { self != .events }
+    var includesEvents: Bool {
+        switch self {
+        case .events: true
+        case .reminders: false
+        }
+    }
+
+    var includesReminders: Bool {
+        switch self {
+        case .events: false
+        case .reminders: true
+        }
+    }
 }
 
 struct EventKitManagerError: LocalizedError {
@@ -95,7 +103,7 @@ private final class LockedBox<Value>: @unchecked Sendable {
 
 public class EventKitManager {
     /// `timeFormat` controls how `eventToDict`/`reminderToDict` render
-    /// timestamps — see `TimeFormat` (issue #3).
+    /// timestamps — see `TimeFormat`.
     public init(timeFormat: TimeFormat = .rfc3339) {
         self.timeFormat = timeFormat
     }
@@ -113,23 +121,16 @@ public class EventKitManager {
     /// This must be called before any other EventKit operation. Denial of a
     /// *needed* permission throws `EventKitAccessError`; rendering and process
     /// status selection belong exclusively to the CLI.
-    public func requestAccess(_ scope: AccessScope = .all) throws {
+    public func requestAccess(_ scope: AccessScope) throws {
         var calendarError: Error?
         var reminderError: Error?
 
         if scope.includesEvents {
             let semaphore = DispatchSemaphore(value: 0)
             let result = LockedBox<(granted: Bool, error: Error?)?>(nil)
-            if #available(macOS 14.0, *) {
-                eventStore.requestFullAccessToEvents { granted, error in
-                    result.set((granted, error))
-                    semaphore.signal()
-                }
-            } else {
-                eventStore.requestAccess(to: .event) { granted, error in
-                    result.set((granted, error))
-                    semaphore.signal()
-                }
+            eventStore.requestFullAccessToEvents { granted, error in
+                result.set((granted, error))
+                semaphore.signal()
             }
             guard semaphore.wait(timeout: .now() + Self.permissionWait) == .success,
                   let accessResult = result.get()
@@ -143,16 +144,9 @@ public class EventKitManager {
         if scope.includesReminders {
             let semaphore = DispatchSemaphore(value: 0)
             let result = LockedBox<(granted: Bool, error: Error?)?>(nil)
-            if #available(macOS 14.0, *) {
-                eventStore.requestFullAccessToReminders { granted, error in
-                    result.set((granted, error))
-                    semaphore.signal()
-                }
-            } else {
-                eventStore.requestAccess(to: .reminder) { granted, error in
-                    result.set((granted, error))
-                    semaphore.signal()
-                }
+            eventStore.requestFullAccessToReminders { granted, error in
+                result.set((granted, error))
+                semaphore.signal()
             }
             guard semaphore.wait(timeout: .now() + Self.permissionWait) == .success,
                   let accessResult = result.get()
@@ -195,11 +189,6 @@ public class EventKitManager {
             deniedStore = calendarAccessGranted ? nil : "Calendar"
         case .reminders:
             deniedStore = reminderAccessGranted ? nil : "Reminders"
-        case .all:
-            // Mixed-store commands degrade gracefully when only one side is
-            // granted, so only a full denial is fatal.
-            deniedStore = (calendarAccessGranted || reminderAccessGranted)
-                ? nil : "Calendar and Reminders"
         }
         if let deniedStore {
             throw EventKitAccessError.denied(store: deniedStore)
@@ -217,7 +206,7 @@ public class EventKitManager {
     ) -> Bool {
         let status = EKEventStore.authorizationStatus(for: entityType)
         if status == .denied || status == .restricted { return true }
-        if #available(macOS 14.0, *), status == .writeOnly { return true }
+        if status == .writeOnly { return true }
         return false
     }
 
@@ -467,11 +456,6 @@ public class EventKitManager {
         let eventDicts = filtered.map { eventToDict($0) }
 
         return JSONOutput.success(["events": eventDicts, "count": eventDicts.count])
-    }
-
-    /// Convenience overload that accepts a single calendar ID.
-    public func listEvents(calendarID: String, from startDate: Date, to endDate: Date) -> JSONOutput {
-        return listEvents(calendarIDs: [calendarID], from: startDate, to: endDate)
     }
 
     /// Single source of truth for mapping EKEventAvailability to its public string
@@ -1525,14 +1509,36 @@ public class EventKitManager {
         case failure(String)
     }
 
-    /// Resolves a string address only after the caller has explicitly opted in.
-    /// Timeout cancels the underlying request, and every failure occurs before
-    /// an EventKit save is attempted.
-    private func resolveLocation(_ address: String) throws -> EKStructuredLocation {
-        let semaphore = DispatchSemaphore(value: 0)
-        let result = LockedBox<GeocodeResult?>(nil)
-        let geocoder = CLGeocoder()
+    @available(macOS 26.0, *)
+    private func beginMapKitGeocoding(
+        _ address: String,
+        result: LockedBox<GeocodeResult?>,
+        semaphore: DispatchSemaphore
+    ) throws -> () -> Void {
+        guard let request = MKGeocodingRequest(addressString: address) else {
+            throw EventKitManagerError(
+                message: "Geocoding rejected the address; no event was saved.")
+        }
+        request.getMapItems { mapItems, error in
+            if let location = mapItems?.first?.location {
+                result.set(.success(location))
+            } else {
+                result.set(.failure(error?.localizedDescription ?? "No matching location was found."))
+            }
+            semaphore.signal()
+        }
+        return { request.cancel() }
+    }
 
+    /// The MapKit replacement for CLGeocoder starts in macOS 26. Keep this
+    /// isolated fallback only for supported systems earlier than macOS 26.
+    @available(macOS, introduced: 14.0, obsoleted: 26.0)
+    private func beginLegacyGeocoding(
+        _ address: String,
+        result: LockedBox<GeocodeResult?>,
+        semaphore: DispatchSemaphore
+    ) -> () -> Void {
+        let geocoder = CLGeocoder()
         geocoder.geocodeAddressString(address) { placemarks, error in
             if let location = placemarks?.first?.location {
                 result.set(.success(location))
@@ -1541,11 +1547,28 @@ public class EventKitManager {
             }
             semaphore.signal()
         }
+        return { geocoder.cancelGeocode() }
+    }
+
+    /// Resolves a string address only after the caller has explicitly opted in.
+    /// Timeout cancels the underlying request, and every failure occurs before
+    /// an EventKit save is attempted.
+    private func resolveLocation(_ address: String) throws -> EKStructuredLocation {
+        let semaphore = DispatchSemaphore(value: 0)
+        let result = LockedBox<GeocodeResult?>(nil)
+        let cancelRequest: () -> Void
+        if #available(macOS 26.0, *) {
+            cancelRequest = try beginMapKitGeocoding(
+                address, result: result, semaphore: semaphore)
+        } else {
+            cancelRequest = beginLegacyGeocoding(
+                address, result: result, semaphore: semaphore)
+        }
 
         let deadline = Date(timeIntervalSinceNow: Self.geocodeWait)
         while semaphore.wait(timeout: .now()) == .timedOut {
             if Date() >= deadline {
-                geocoder.cancelGeocode()
+                cancelRequest()
                 throw EventKitManagerError(
                     message: "Geocoding timed out after \(Int(Self.geocodeWait)) seconds; no event was saved.")
             }
@@ -1598,7 +1621,7 @@ public class EventKitManager {
     }
 
     /// EventKit does not offer an in-place "set relative offsets" operation:
-    /// ekctl removes every existing alarm object and creates new relative
+    /// eventkitcontrol removes every existing alarm object and creates new relative
     /// alarms. Keep this preview deliberately explicit because an existing
     /// absolute alarm or custom action/geofence carries more information than
     /// its relative trigger alone.
@@ -1751,8 +1774,8 @@ public class EventKitManager {
         let formatter = DateFormatter()
         // POSIX locale forces 24-hour `HH` to actually mean 24-hour, regardless of the
         // user's "Use 24-hour time" system preference (Apple QA1480). Without this, PM
-        // times silently render as 12-hour without an AM/PM marker on locales like en_GB
-        // — e.g. 16:00 becomes "4:00" (see issue #8).
+        // times silently render as 12-hour without an AM/PM marker on locales like en_GB,
+        // so 16:00 can otherwise become "4:00".
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = timeFormat.dateFormatPattern  // ISO 8601 with timezone offset
         formatter.timeZone = TimeZone.current

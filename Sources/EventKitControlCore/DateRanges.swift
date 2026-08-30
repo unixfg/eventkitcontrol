@@ -37,7 +37,7 @@ public enum DateRanges {
         return (start, end)
     }
 
-    /// Range from `now` to `now + days` (used by `ekctl next`'s lookahead
+/// Range from `now` to `now + days` (used by `eventkitcontrol next`'s lookahead
     /// window). Uses calendar arithmetic so DST transitions are handled
     /// correctly — straight `TimeInterval(days * 86400)` arithmetic would
     /// be off by an hour twice a year.

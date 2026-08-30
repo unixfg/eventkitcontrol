@@ -35,6 +35,7 @@ DerivedData/
 *~
 
 # Build artifacts
+dist/
 *.d
 *.o
 *.swiftdeps

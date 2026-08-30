@@ -1,93 +1,521 @@
 name: Release
 
-# Builds a universal (arm64 + x86_64) ekctl binary and attaches it to the
-# GitHub Release for a tag, so users can install without a full Xcode
-# toolchain (issue #11).
-#
-# Triggers:
-#   - automatically on every pushed v* tag
-#   - manually via workflow_dispatch for an existing tag (used to backfill
-#     releases such as v1.4.0)
-
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to build and release (e.g., v1.4.0)"
-        required: true
-        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   release:
-    runs-on: macos-15
+    name: Sign, notarize, and publish ARM64 PKG
+    runs-on: macos-26
+    timeout-minutes: 90
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - name: Resolve tag
-        id: tag
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate runner, release tag, and source version
         env:
-          DISPATCH_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${DISPATCH_TAG}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          set -Eeuo pipefail
+          test "$(uname -m)" = arm64
+
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$ ]]; then
+            echo "error: release tags must use canonical vMAJOR.MINOR.PATCH form" >&2
+            exit 1
           fi
 
-      - name: Check out tag
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
+          VERSION="${RELEASE_TAG#v}"
+          PLIST_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - Info.plist)"
+          BUILD_VERSION="$(plutil -extract CFBundleVersion raw -o - Info.plist)"
+          if [[ "$PLIST_VERSION" != "$BUILD_VERSION" ]]; then
+            echo "error: Info.plist marketing and build versions differ" >&2
+            exit 1
+          fi
+          if [[ "$VERSION" != "$PLIST_VERSION" ]]; then
+            echo "error: tag $RELEASE_TAG does not match Info.plist version $PLIST_VERSION" >&2
+            exit 1
+          fi
 
-      - name: Build universal binary
-        run: swift build -c release --arch arm64 --arch x86_64
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          TAG_COMMIT="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "$HEAD_COMMIT" != "$TAG_COMMIT" ]]; then
+            echo "error: checkout does not match tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$HEAD_COMMIT" origin/main; then
+            echo "error: tagged commit is not reachable from origin/main" >&2
+            exit 1
+          fi
 
-      - name: Sign with entitlements
-        run: |
-          BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/ekctl"
-          codesign --force --sign - --entitlements ekctl.entitlements "$BIN"
-          lipo -info "$BIN"
+          xcodebuild -version
+          swift --version
 
-      - name: Package
-        run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/ekctl"
-          mkdir -p dist
-          cp "$BIN" dist/ekctl
-          tar -C dist -czf "ekctl-${TAG}.tar.gz" ekctl
-          shasum -a 256 "ekctl-${TAG}.tar.gz" > "ekctl-${TAG}.tar.gz.sha256"
-          cat "ekctl-${TAG}.tar.gz.sha256"
-
-      - name: Create or update release
+      - name: Refuse to replace an existing release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          INSTALL_NOTES="## Install (prebuilt universal binary, no Xcode required)
-
-          \`\`\`bash
-          curl -L -o ekctl.tar.gz https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/ekctl-${TAG}.tar.gz
-          tar -xzf ekctl.tar.gz
-          xattr -d com.apple.quarantine ekctl 2>/dev/null || true
-          sudo mv ekctl /usr/local/bin/
-          \`\`\`
-
-          The binary is universal (arm64 + x86_64) and ad-hoc signed. The \`xattr\` step clears the quarantine flag Gatekeeper puts on downloaded binaries; it is safe to skip if you build from source instead."
-
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              "ekctl-${TAG}.tar.gz" "ekctl-${TAG}.tar.gz.sha256" \
-              --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$TAG" \
-              "ekctl-${TAG}.tar.gz" "ekctl-${TAG}.tar.gz.sha256" \
-              --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --title "$TAG" \
-              --generate-notes \
-              --notes "$INSTALL_NOTES"
+          set -Eeuo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "error: release $RELEASE_TAG already exists; refusing to replace it" >&2
+            exit 1
           fi
+
+      - name: Validate metadata and run tests
+        run: |
+          set -Eeuo pipefail
+          ./Scripts/validate-lockfile.sh
+          plutil -lint Info.plist eventkitcontrol.entitlements
+          swift package dump-package >/dev/null
+          swift test --disable-automatic-resolution
+          git diff --exit-code -- Package.resolved
+
+      - name: Import dedicated release credentials
+        id: signing
+        env:
+          APP_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APP_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          INSTALLER_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          INSTALLER_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SIGNING_KEYCHAIN: ${{ runner.temp }}/eventkitcontrol-signing.keychain-db
+          APPLICATION_P12_PATH: ${{ runner.temp }}/eventkitcontrol-application.p12
+          INSTALLER_P12_PATH: ${{ runner.temp }}/eventkitcontrol-installer.p12
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          for required_name in \
+            APP_P12_BASE64 \
+            APP_P12_PASSWORD \
+            INSTALLER_P12_BASE64 \
+            INSTALLER_P12_PASSWORD \
+            APPLE_TEAM_ID; do
+            if [[ -z "${!required_name:-}" ]]; then
+              echo "error: required release secret is empty: $required_name" >&2
+              exit 1
+            fi
+          done
+          [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] \
+            || { echo "error: APPLE_TEAM_ID has an invalid format" >&2; exit 1; }
+
+          for secret_path in \
+            "$SIGNING_KEYCHAIN" \
+            "$APPLICATION_P12_PATH" \
+            "$INSTALLER_P12_PATH"; do
+            [[ ! -e "$secret_path" && ! -L "$secret_path" ]] \
+              || { echo "error: refusing to replace credential path: $secret_path" >&2; exit 1; }
+          done
+
+          printf '%s' "$APP_P12_BASE64" | base64 --decode >"$APPLICATION_P12_PATH"
+          printf '%s' "$INSTALLER_P12_BASE64" | base64 --decode >"$INSTALLER_P12_PATH"
+          chmod 0600 "$APPLICATION_P12_PATH" "$INSTALLER_P12_PATH"
+          test -s "$APPLICATION_P12_PATH"
+          test -s "$INSTALLER_P12_PATH"
+
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
+          security import "$APPLICATION_P12_PATH" \
+            -k "$SIGNING_KEYCHAIN" \
+            -P "$APP_P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security import "$INSTALLER_P12_PATH" \
+            -k "$SIGNING_KEYCHAIN" \
+            -P "$INSTALLER_P12_PASSWORD" \
+            -T /usr/bin/productbuild \
+            -T /usr/bin/security
+          rm -f "$APPLICATION_P12_PATH" "$INSTALLER_P12_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$SIGNING_KEYCHAIN"
+
+          security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" \
+            >"$RUNNER_TEMP/application-identities.txt"
+          security find-identity -v "$SIGNING_KEYCHAIN" \
+            >"$RUNNER_TEMP/all-identities.txt"
+
+          python3 - \
+            "$RUNNER_TEMP/application-identities.txt" \
+            "$RUNNER_TEMP/all-identities.txt" \
+            "$APPLE_TEAM_ID" \
+            "$RUNNER_TEMP/application-identity.txt" \
+            "$RUNNER_TEMP/installer-identity.txt" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          application_input, all_input, team_id, application_output, installer_output = sys.argv[1:]
+          identity_pattern = re.compile(
+              r'^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"([^"]+)"\s*$'
+          )
+
+          def identities(path):
+              result = []
+              for line in pathlib.Path(path).read_text().splitlines():
+                  match = identity_pattern.match(line)
+                  if match:
+                      result.append((match.group(1), match.group(2)))
+              return result
+
+          applications = [
+              (fingerprint, name)
+              for fingerprint, name in identities(application_input)
+              if name.startswith("Developer ID Application: ")
+              and name.endswith(f" ({team_id})")
+          ]
+          installers = [
+              (fingerprint, name)
+              for fingerprint, name in identities(all_input)
+              if name.startswith("Developer ID Installer: ")
+              and name.endswith(f" ({team_id})")
+          ]
+
+          if len(applications) != 1:
+              print(
+                  f"error: expected exactly one valid Developer ID Application identity; "
+                  f"found {len(applications)}",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          if len(installers) != 1:
+              print(
+                  f"error: expected exactly one valid Developer ID Installer identity; "
+                  f"found {len(installers)}",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+
+          pathlib.Path(application_output).write_text(applications[0][0] + "\n")
+          pathlib.Path(installer_output).write_text(installers[0][1] + "\n")
+          PY
+
+          APPLICATION_IDENTITY="$(sed -n '1p' "$RUNNER_TEMP/application-identity.txt")"
+          INSTALLER_IDENTITY="$(sed -n '1p' "$RUNNER_TEMP/installer-identity.txt")"
+          [[ "$APPLICATION_IDENTITY" =~ ^[0-9A-Fa-f]{40}$ ]]
+          [[ "$INSTALLER_IDENTITY" == "Developer ID Installer: "*"(${APPLE_TEAM_ID})" ]]
+
+          echo "application_identity=$APPLICATION_IDENTITY" >>"$GITHUB_OUTPUT"
+          echo "installer_identity=$INSTALLER_IDENTITY" >>"$GITHUB_OUTPUT"
+
+      - name: Build Developer ID-signed ARM64 executable
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLICATION_IDENTITY: ${{ steps.signing.outputs.application_identity }}
+          SIGNING_KEYCHAIN: ${{ runner.temp }}/eventkitcontrol-signing.keychain-db
+        run: |
+          ./Scripts/build-artifact.sh \
+            --output-dir dist \
+            --signing-mode developer-id \
+            --signing-identity "$APPLICATION_IDENTITY" \
+            --team-id "$APPLE_TEAM_ID" \
+            --keychain "$SIGNING_KEYCHAIN"
+
+      - name: Build signed product package
+        id: package
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          INSTALLER_IDENTITY: ${{ steps.signing.outputs.installer_identity }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SIGNING_KEYCHAIN: ${{ runner.temp }}/eventkitcontrol-signing.keychain-db
+        run: |
+          set -Eeuo pipefail
+          PACKAGE_NAME="eventkitcontrol-${RELEASE_TAG}-macos-arm64.pkg"
+          ./Scripts/build-package.sh \
+            --signing-mode developer-id \
+            --team-id "$APPLE_TEAM_ID" \
+            --installer-identity "$INSTALLER_IDENTITY" \
+            --keychain "$SIGNING_KEYCHAIN" \
+            --output "dist/$PACKAGE_NAME" \
+            dist/eventkitcontrol
+          echo "name=$PACKAGE_NAME" >>"$GITHUB_OUTPUT"
+          echo "path=$GITHUB_WORKSPACE/dist/$PACKAGE_NAME" >>"$GITHUB_OUTPUT"
+
+      - name: Remove package-signing credentials
+        if: always()
+        env:
+          SIGNING_KEYCHAIN: ${{ runner.temp }}/eventkitcontrol-signing.keychain-db
+          APPLICATION_P12_PATH: ${{ runner.temp }}/eventkitcontrol-application.p12
+          INSTALLER_P12_PATH: ${{ runner.temp }}/eventkitcontrol-installer.p12
+        run: |
+          set +e
+          security delete-keychain "$SIGNING_KEYCHAIN" >/dev/null 2>&1
+          rm -f \
+            "$APPLICATION_P12_PATH" \
+            "$INSTALLER_P12_PATH" \
+            "$RUNNER_TEMP/application-identity.txt" \
+            "$RUNNER_TEMP/installer-identity.txt" \
+            "$RUNNER_TEMP/application-identities.txt" \
+            "$RUNNER_TEMP/all-identities.txt"
+
+      - name: Notarize package and inspect the notary log
+        env:
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+          NOTARY_KEY_PATH: ${{ runner.temp }}/eventkitcontrol-notary-key.p8
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          : "${NOTARY_KEY_BASE64:?APPLE_NOTARY_KEY_P8_BASE64 is required}"
+          : "${APPLE_NOTARY_KEY_ID:?APPLE_NOTARY_KEY_ID is required}"
+          : "${APPLE_NOTARY_ISSUER_ID:?APPLE_NOTARY_ISSUER_ID is required}"
+          [[ "$APPLE_NOTARY_KEY_ID" =~ ^[A-Z0-9]+$ ]] \
+            || { echo "error: invalid notary key ID format" >&2; exit 1; }
+          [[ "$APPLE_NOTARY_ISSUER_ID" =~ ^[0-9A-Fa-f-]{36}$ ]] \
+            || { echo "error: invalid notary issuer ID format" >&2; exit 1; }
+          [[ ! -e "$NOTARY_KEY_PATH" && ! -L "$NOTARY_KEY_PATH" ]] \
+            || { echo "error: refusing to replace notary key path" >&2; exit 1; }
+          printf '%s' "$NOTARY_KEY_BASE64" | base64 --decode >"$NOTARY_KEY_PATH"
+          chmod 0600 "$NOTARY_KEY_PATH"
+          test -s "$NOTARY_KEY_PATH"
+
+          SUBMIT_JSON="$RUNNER_TEMP/notary-submit.json"
+          SUBMIT_STDERR="$RUNNER_TEMP/notary-submit.stderr"
+          SUBMISSION_ID_FILE="$RUNNER_TEMP/notary-submission-id.txt"
+          SUBMISSION_STATUS_FILE="$RUNNER_TEMP/notary-submission-status.txt"
+          NOTARY_LOG="$RUNNER_TEMP/notary-log.json"
+          NOTARY_LOG_STDERR="$RUNNER_TEMP/notary-log.stderr"
+
+          SUBMIT_RC=0
+          xcrun notarytool submit "$PACKAGE_PATH" \
+            --key "$NOTARY_KEY_PATH" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait \
+            --timeout 60m \
+            --output-format json \
+            >"$SUBMIT_JSON" \
+            2>"$SUBMIT_STDERR" || SUBMIT_RC=$?
+
+          PARSE_RC=0
+          python3 - \
+            "$SUBMIT_JSON" \
+            "$SUBMISSION_ID_FILE" \
+            "$SUBMISSION_STATUS_FILE" <<'PY' || PARSE_RC=$?
+          import json
+          import pathlib
+          import sys
+
+          try:
+              result = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          except Exception as error:
+              print(f"error: could not parse notary submission JSON: {error}", file=sys.stderr)
+              raise SystemExit(1)
+
+          submission_id = result.get("id")
+          status = result.get("status")
+          if not isinstance(submission_id, str) or not submission_id:
+              print("error: notary submission returned no ID", file=sys.stderr)
+              raise SystemExit(1)
+          if not isinstance(status, str) or not status:
+              print("error: notary submission returned no status", file=sys.stderr)
+              raise SystemExit(1)
+          pathlib.Path(sys.argv[2]).write_text(submission_id + "\n")
+          pathlib.Path(sys.argv[3]).write_text(status + "\n")
+          PY
+
+          SUBMISSION_ID=""
+          SUBMISSION_STATUS=""
+          if [[ -s "$SUBMISSION_ID_FILE" ]]; then
+            IFS= read -r SUBMISSION_ID <"$SUBMISSION_ID_FILE"
+          fi
+          if [[ -s "$SUBMISSION_STATUS_FILE" ]]; then
+            IFS= read -r SUBMISSION_STATUS <"$SUBMISSION_STATUS_FILE"
+          fi
+
+          LOG_RC=1
+          if [[ "$SUBMISSION_ID" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+            LOG_RC=0
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --key "$NOTARY_KEY_PATH" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              "$NOTARY_LOG" \
+              2>"$NOTARY_LOG_STDERR" || LOG_RC=$?
+          fi
+
+          LOG_VALIDATION_RC=1
+          if [[ "$LOG_RC" -eq 0 && -s "$NOTARY_LOG" ]]; then
+            LOG_VALIDATION_RC=0
+            python3 - "$NOTARY_LOG" <<'PY' || LOG_VALIDATION_RC=$?
+          import json
+          import pathlib
+          import sys
+
+          try:
+              result = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          except Exception as error:
+              print(f"error: could not parse notary log JSON: {error}", file=sys.stderr)
+              raise SystemExit(1)
+
+          if result.get("status") != "Accepted":
+              print(f"error: notary log status is {result.get('status')!r}", file=sys.stderr)
+              raise SystemExit(1)
+          issues = result.get("issues")
+          if issues not in (None, []):
+              print(f"error: notary log contains issues: {issues!r}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+          fi
+
+          if [[ "$SUBMIT_RC" -ne 0 \
+            || "$PARSE_RC" -ne 0 \
+            || "$SUBMISSION_STATUS" != "Accepted" \
+            || "$LOG_RC" -ne 0 \
+            || "$LOG_VALIDATION_RC" -ne 0 ]]; then
+            echo "error: notarization did not complete with a clean Accepted result" >&2
+            exit 1
+          fi
+
+      - name: Remove notary API key
+        if: always()
+        env:
+          NOTARY_KEY_PATH: ${{ runner.temp }}/eventkitcontrol-notary-key.p8
+        run: rm -f "$NOTARY_KEY_PATH"
+
+      - name: Upload notarization diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: notarization-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/notary-submit.json
+            ${{ runner.temp }}/notary-submit.stderr
+            ${{ runner.temp }}/notary-log.json
+            ${{ runner.temp }}/notary-log.stderr
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Staple and validate final package
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          INSTALLER_IDENTITY: ${{ steps.signing.outputs.installer_identity }}
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+        run: |
+          set -Eeuo pipefail
+          xcrun stapler staple -v "$PACKAGE_PATH"
+          xcrun stapler validate -v "$PACKAGE_PATH"
+          pkgutil --check-signature "$PACKAGE_PATH"
+          spctl --assess --type install --verbose=4 "$PACKAGE_PATH"
+          ./Scripts/validate-package.sh \
+            --signature developer-id \
+            --team-id "$APPLE_TEAM_ID" \
+            --installer-identity "$INSTALLER_IDENTITY" \
+            "$PACKAGE_PATH" \
+            dist/eventkitcontrol
+
+      - name: Smoke-test package installation
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+        run: |
+          set -Eeuo pipefail
+          INSTALLED_BINARY=/usr/local/bin/eventkitcontrol
+          [[ ! -e "$INSTALLED_BINARY" && ! -L "$INSTALLED_BINARY" ]] \
+            || { echo "error: install target unexpectedly exists" >&2; exit 1; }
+          sudo installer -pkg "$PACKAGE_PATH" -target /
+          [[ "$(stat -f '%Su:%Sg' "$INSTALLED_BINARY")" == "root:wheel" ]]
+          [[ "$(stat -f '%Lp' "$INSTALLED_BINARY")" == "755" ]]
+          [[ "$("$INSTALLED_BINARY" --version | awk 'NF { print $NF; exit }')" == "${GITHUB_REF_NAME#v}" ]]
+          ./Scripts/validate-artifact.sh \
+            --signature developer-id \
+            --team-id "$APPLE_TEAM_ID" \
+            "$INSTALLED_BINARY"
+
+      - name: Create and verify SHA-256 checksum
+        id: checksum
+        env:
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+        run: |
+          set -Eeuo pipefail
+          cd dist
+          shasum -a 256 "$PACKAGE_NAME" >"$PACKAGE_NAME.sha256"
+          shasum -a 256 -c "$PACKAGE_NAME.sha256"
+          echo "name=$PACKAGE_NAME.sha256" >>"$GITHUB_OUTPUT"
+          echo "path=$GITHUB_WORKSPACE/dist/$PACKAGE_NAME.sha256" >>"$GITHUB_OUTPUT"
+
+      - name: Attest final release artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ steps.package.outputs.path }}
+            ${{ steps.checksum.outputs.path }}
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          CHECKSUM_NAME: ${{ steps.checksum.outputs.name }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_NOTES: |
+            ## Install
+
+            Download both files, verify the checksum, and run the signed installer:
+
+            ```bash
+            curl -fLO "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.package.outputs.name }}"
+            curl -fLO "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.checksum.outputs.name }}"
+            shasum -a 256 -c "${{ steps.checksum.outputs.name }}"
+            sudo installer -pkg "${{ steps.package.outputs.name }}" -target /
+            eventkitcontrol --version
+            ```
+
+            The package is Apple Silicon-only, Developer ID signed, notarized,
+            stapled for offline Gatekeeper validation, and installs
+            `eventkitcontrol` at `/usr/local/bin/eventkitcontrol`.
+        run: |
+          set -Eeuo pipefail
+          gh release create "$RELEASE_TAG" \
+            "dist/$PACKAGE_NAME" \
+            "dist/$CHECKSUM_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "eventkitcontrol $RELEASE_TAG" \
+            --generate-notes \
+            --notes "$RELEASE_NOTES"
+
+      - name: Final release credential cleanup fallback
+        if: always()
+        env:
+          SIGNING_KEYCHAIN: ${{ runner.temp }}/eventkitcontrol-signing.keychain-db
+          APPLICATION_P12_PATH: ${{ runner.temp }}/eventkitcontrol-application.p12
+          INSTALLER_P12_PATH: ${{ runner.temp }}/eventkitcontrol-installer.p12
+          NOTARY_KEY_PATH: ${{ runner.temp }}/eventkitcontrol-notary-key.p8
+        run: |
+          set +e
+          security delete-keychain "$SIGNING_KEYCHAIN" >/dev/null 2>&1
+          rm -f \
+            "$APPLICATION_P12_PATH" \
+            "$INSTALLER_P12_PATH" \
+            "$NOTARY_KEY_PATH" \
+            "$RUNNER_TEMP/application-identity.txt" \
+            "$RUNNER_TEMP/installer-identity.txt" \
+            "$RUNNER_TEMP/application-identities.txt" \
+            "$RUNNER_TEMP/all-identities.txt"

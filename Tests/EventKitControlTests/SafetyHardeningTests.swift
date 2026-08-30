@@ -1,7 +1,7 @@
 import Foundation
 import EventKit
 import XCTest
-@testable import ekctlCore
+@testable import EventKitControlCore
 
 final class StrictDateParsingSafetyTests: XCTestCase {
     func testRejectsCalendarNormalisationAndTrailingInput() {
@@ -36,7 +36,7 @@ final class AlarmParsingSafetyTests: XCTestCase {
     func testMalformedListFailsAtomically() {
         XCTAssertThrowsError(try AlarmParsing.parseRequired("abc,10"))
         XCTAssertThrowsError(try AlarmParsing.parseRequired("10,,20"))
-        XCTAssertNil(AlarmParsing.parse("abc,10"))
+        XCTAssertNil(try? AlarmParsing.parseRequired("abc,10"))
     }
 
     func testRejectsEmptyNonFiniteExponentDuplicateAndExcessiveValues() {

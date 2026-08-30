@@ -3,22 +3,18 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.ekctl.cli</string>
+    <string>io.github.unixfg.eventkitcontrol</string>
     <key>CFBundleName</key>
-    <string>ekctl</string>
+    <string>eventkitcontrol</string>
     <key>CFBundleVersion</key>
-    <string>1.5.0</string>
+    <string>1.0.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.5.0</string>
+    <string>1.0.0</string>
     <key>CFBundleExecutable</key>
-    <string>ekctl</string>
-    <key>NSCalendarsUsageDescription</key>
-    <string>ekctl needs access to your calendars to list, create, modify, and delete calendar events.</string>
-    <key>NSRemindersUsageDescription</key>
-    <string>ekctl needs access to your reminders to list, create, modify, and delete reminders.</string>
+    <string>eventkitcontrol</string>
     <key>NSCalendarsFullAccessUsageDescription</key>
-    <string>ekctl needs full access to your calendars to list, create, modify, and delete calendar events.</string>
+    <string>eventkitcontrol needs full access to your calendars to list, create, modify, and delete calendar events.</string>
     <key>NSRemindersFullAccessUsageDescription</key>
-    <string>ekctl needs full access to your reminders to list, create, modify, and delete reminders.</string>
+    <string>eventkitcontrol needs full access to your reminders to list, create, modify, and delete reminders.</string>
 </dict>
 </plist>

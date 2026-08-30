@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import Foundation
 import PackageDescription
 
@@ -8,31 +8,31 @@ let infoPlistPath = URL(fileURLWithPath: #filePath)
     .path
 
 let package = Package(
-    name: "ekctl",
+    name: "eventkitcontrol",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
-        .executable(name: "ekctl", targets: ["ekctl"])
+        .executable(name: "eventkitcontrol", targets: ["EventKitControl"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser.git", exact: "1.7.2")
+        .package(url: "https://github.com/apple/swift-argument-parser.git", exact: "1.8.2")
     ],
     targets: [
         .target(
-            name: "ekctlCore",
+            name: "EventKitControlCore",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
-            path: "Sources/ekctlCore"
+            path: "Sources/EventKitControlCore"
         ),
         .executableTarget(
-            name: "ekctl",
+            name: "EventKitControl",
             dependencies: [
-                "ekctlCore",
+                "EventKitControlCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
-            path: "Sources/ekctl",
+            path: "Sources/EventKitControl",
             linkerSettings: [
                 .unsafeFlags(
                     [
@@ -46,11 +46,12 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "ekctlTests",
+            name: "EventKitControlTests",
             dependencies: [
-                "ekctlCore",
+                "EventKitControlCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
-            ]
+            ],
+            path: "Tests/EventKitControlTests"
         )
     ]
 )

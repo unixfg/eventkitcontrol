@@ -1,11 +1,14 @@
 import Darwin
 import Foundation
 
-// Darwin also imports the POSIX `struct flock`; binding the function once
-// avoids that name collision when calls are module-qualified in Swift.
-private let systemFlock: (Int32, Int32) -> Int32 = flock
+// Darwin also imports the POSIX `struct flock`; an unqualified call inside a
+// wrapper avoids that name collision without storing a non-Sendable global
+// function value under Swift 6 concurrency checking.
+private func systemFlock(_ descriptor: Int32, _ operation: Int32) -> Int32 {
+    flock(descriptor, operation)
+}
 
-/// Errors produced while validating or persisting ekctl's configuration.
+/// Errors produced while validating or persisting eventkitcontrol's configuration.
 public enum ConfigStoreError: Error, LocalizedError {
     case invalidRoot(String)
     case unsafeEntry(path: String, reason: String)
@@ -59,7 +62,7 @@ public enum ConfigStoreError: Error, LocalizedError {
 /// Reads are side-effect-free and use atomic replacement for coherent snapshots.
 /// Mutations hold an in-process lock and an advisory file lock across the complete
 /// read-modify-write sequence so concurrent processes cannot lose alias updates.
-public struct ConfigStore {
+public struct ConfigStore: Sendable {
     public static let maximumConfigSize = 1_048_576
     public static let maximumAliasCount = 10_000
     public static let lockTimeoutSeconds = 5
@@ -106,12 +109,12 @@ public struct ConfigStore {
         self.repairExistingPermissions = repairExistingPermissions
     }
 
-    /// The production location. `EKCTL_CONFIG_DIR` is an optional absolute-path
+    /// The production location. `EVENTKITCONTROL_CONFIG_DIR` is an optional absolute-path
     /// override intended for isolated integrations and end-to-end tests.
     public static func production(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> ConfigStore {
-        if let override = environment["EKCTL_CONFIG_DIR"] {
+        if let override = environment["EVENTKITCONTROL_CONFIG_DIR"] {
             guard !override.isEmpty, override.hasPrefix("/") else {
                 throw ConfigStoreError.invalidRoot(override)
             }
@@ -122,15 +125,15 @@ public struct ConfigStore {
         }
 
         let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".ekctl", isDirectory: true)
-        // Only the canonical, narrowly scoped ~/.ekctl location is eligible
-        // for legacy permission repair. Arbitrary injected/override roots must
+            .appendingPathComponent(".eventkitcontrol", isDirectory: true)
+        // Only the canonical, narrowly scoped ~/.eventkitcontrol location is eligible
+        // for permission repair. Arbitrary injected/override roots must
         // already be private and are never chmod'd as a side effect.
         return try ConfigStore(rootURL: root, repairExistingPermissions: true)
     }
 
     /// An environment typo must not turn a broad directory (home, a temp
-    /// root, or the working tree) into an ekctl config store. Existing override
+    /// root, or the working tree) into an eventkitcontrol config store. Existing override
     /// directories are accepted only when empty or already contain solely the
     /// two entries managed by this store.
     private func validateOverrideRootScope() throws {
@@ -178,7 +181,7 @@ public struct ConfigStore {
         guard unexpected.isEmpty else {
             throw ConfigStoreError.unsafeEntry(
                 path: standardizedPath,
-                reason: "contains entries not managed by ekctl: \(unexpected.joined(separator: ", "))"
+                reason: "contains entries not managed by eventkitcontrol: \(unexpected.joined(separator: ", "))"
             )
         }
     }
@@ -747,8 +750,8 @@ public struct ConfigStore {
     }
 }
 
-/// Compatibility facade for existing CLI call sites. New code should depend on
-/// an injected `ConfigStore` and use its throwing read methods directly.
+/// Narrow facade for CLI call sites that use the production configuration.
+/// Reads remain throwing so corrupted or unsafe configuration always fails closed.
 public struct ConfigManager {
     private static func productionStore() throws -> ConfigStore {
         try ConfigStore.production()
@@ -770,57 +773,19 @@ public struct ConfigManager {
         try ConfigStore.validateAliasName(name)
     }
 
-    /// Throwing read API for fail-closed command paths.
-    public static func getAliasesThrowing() throws -> [String: String] {
+    public static func getAliases() throws -> [String: String] {
         try productionStore().getAliases()
     }
 
-    /// Throwing alias resolution for fail-closed command paths.
-    public static func resolveAliasThrowing(_ nameOrID: String) throws -> String {
+    public static func resolveAlias(_ nameOrID: String) throws -> String {
         try productionStore().resolveAlias(nameOrID)
     }
 
-    /// Throwing multi-calendar resolution for fail-closed command paths.
-    public static func resolveCalendarIDsThrowing(_ list: String) throws -> [String] {
+    public static func resolveCalendarIDs(_ list: String) throws -> [String] {
         try productionStore().resolveCalendarIDs(list)
     }
 
-    /// Temporary non-throwing adapter retained until CLI commands accept an
-    /// injected ConfigStore. It never writes after a failed read.
-    public static func getAliases() -> [String: String] {
-        do {
-            return try productionStore().getAliases()
-        } catch {
-            return [:]
-        }
-    }
-
-    /// Temporary non-throwing adapter retained for source compatibility.
-    public static func resolveAlias(_ nameOrID: String) -> String {
-        do {
-            return try productionStore().resolveAlias(nameOrID)
-        } catch {
-            return nameOrID
-        }
-    }
-
-    /// Temporary non-throwing adapter retained for source compatibility.
-    public static func resolveCalendarIDs(_ list: String) -> [String] {
-        do {
-            return try productionStore().resolveCalendarIDs(list)
-        } catch {
-            return list.split(separator: ",").map {
-                $0.trimmingCharacters(in: .whitespaces)
-            }
-        }
-    }
-
-    public static func configPath() -> String {
-        do {
-            return try productionStore().configFileURL.path
-        } catch {
-            return FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".ekctl/config.json").path
-        }
+    public static func configPath() throws -> String {
+        try productionStore().configFileURL.path
     }
 }

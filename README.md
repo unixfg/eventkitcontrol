@@ -1,12 +1,17 @@
-# ekctl
+# eventkitcontrol
 
-Native macOS command-line tool for managing Calendar events and Reminders using EventKit. Output is JSON by default, with `--format csv` and `--format text` available on every command for spreadsheets and quick eyeballing.
+[![CI](https://github.com/unixfg/eventkitcontrol/actions/workflows/ci.yml/badge.svg)](https://github.com/unixfg/eventkitcontrol/actions/workflows/ci.yml)
+
+A safety-first native macOS command-line tool for managing Calendar events and
+Reminders through EventKit. Mutations are explicit and previewable, destructive
+operations fail closed, and output is JSON by default with CSV and plain-text
+formats available for scripting.
 
 ## Features
 
 - List, create, update, and delete calendar events
 - List, create, update, complete, and delete reminders
-- Quick date-range shortcuts: `ekctl today`, `ekctl tomorrow`, `ekctl next`
+- Quick date-range shortcuts: `eventkitcontrol today`, `eventkitcontrol tomorrow`, `eventkitcontrol next`
 - Search and filter (`--search`, `--availability busy`) without piping through jq
 - Calendar aliases (use friendly names instead of UUIDs)
 - JSON, CSV, or plain-text output (`--format json|csv|text`)
@@ -16,47 +21,61 @@ Native macOS command-line tool for managing Calendar events and Reminders using 
 
 ## Requirements
 
-- macOS 13.0 (Ventura) or later
-- Building from source additionally requires a full Xcode installation
-  (the Command Line Tools alone currently fail on the SwiftPM manifest);
-  the prebuilt release binary has no build-time requirements
+- Apple Silicon Mac
+- macOS 14.0 (Sonoma) or later
+- Building from source additionally requires Swift 6 from Xcode 26 or later.
+  Use a full Xcode installation; prebuilt packages have no build-time
+  requirements.
 
 ## Installation
 
-### Prebuilt binary (no Xcode required)
+### Signed package
 
-Every release ships a prebuilt universal (Apple Silicon + Intel) binary —
-pick the latest from the [releases page](https://github.com/schappim/ekctl/releases):
-
-```bash
-curl -L -o ekctl.tar.gz https://github.com/schappim/ekctl/releases/download/v1.5.0/ekctl-v1.5.0.tar.gz
-tar -xzf ekctl.tar.gz
-xattr -d com.apple.quarantine ekctl   # release binaries are ad-hoc signed, not notarized
-sudo mv ekctl /usr/local/bin/
-```
-
-A `.sha256` checksum is published next to each tarball.
-
-### Homebrew
+Tagged releases publish an Apple Silicon product archive signed with Developer
+ID, notarized by Apple, and stapled for offline Gatekeeper validation. Installer
+rejects Intel Macs and macOS releases older than 14.0 before changing the
+system. Replace the tag below with the release you want:
 
 ```bash
-brew tap schappim/ekctl
-brew install ekctl
+TAG=v1.0.0
+PACKAGE="eventkitcontrol-${TAG}-macos-arm64.pkg"
+curl -fLO "https://github.com/unixfg/eventkitcontrol/releases/download/${TAG}/${PACKAGE}"
+curl -fLO "https://github.com/unixfg/eventkitcontrol/releases/download/${TAG}/${PACKAGE}.sha256"
+shasum -a 256 -c "${PACKAGE}.sha256"
+sudo installer -pkg "$PACKAGE" -target /
+eventkitcontrol --version
 ```
+
+The product archive installs `/usr/local/bin/eventkitcontrol`. It contains no
+installer scripts and does not install an upstream compatibility command.
+
+Install a newer PKG the same way to upgrade. To uninstall the executable and
+forget its installer receipt:
+
+```bash
+sudo rm /usr/local/bin/eventkitcontrol
+sudo pkgutil --forget io.github.unixfg.eventkitcontrol.pkg
+```
+
+Uninstalling leaves `~/.eventkitcontrol` in place so configuration is not
+silently deleted.
 
 ### Build from source
 
+Clone the repository and run the supported artifact builder:
+
 ```bash
-git clone https://github.com/schappim/ekctl.git
-cd ekctl
-./build.sh
+git clone https://github.com/unixfg/eventkitcontrol.git
+cd eventkitcontrol
+./Scripts/build-artifact.sh
 ```
 
-`build.sh` uses the checked-in dependency lock, embeds and validates the privacy
-usage descriptions, applies Hardened Runtime plus the EventKit entitlements,
-and prints the unique validated binary and archive paths under a fresh
-`.build/ekctl-build.*/local-package/` directory. It does not install anything
-outside the repository.
+The script builds ARM64 from the checked-in dependency lock, applies an ad-hoc
+Hardened Runtime signature with the EventKit entitlements, validates the binary,
+removes its isolated build scratch data, and prints the binary's unique path
+under `.build/eventkitcontrol-artifact.*`. It creates no archive and installs
+nothing. Successful `main` CI runs also expose short-lived, ad-hoc-signed
+snapshot archives; tagged PKGs are the supported distribution.
 
 ### Permissions
 
@@ -64,6 +83,8 @@ On first run, macOS will prompt for access to the data the command touches.
 Event-calendar and reminder-list commands are separate, so a reminders-only
 workflow never triggers the Calendar prompt (and vice versa). Manage permissions
 in **System Settings → Privacy & Security → Calendars / Reminders**.
+eventkitcontrol has its own bundle identity, so permissions granted to another
+EventKit tool do not carry over.
 
 ## Calendars
 
@@ -72,7 +93,7 @@ in **System Settings → Privacy & Security → Calendars / Reminders**.
 **Command:**
 
 ```bash
-ekctl list calendars
+eventkitcontrol list calendars
 ```
 
 **Output:**
@@ -95,12 +116,12 @@ ekctl list calendars
 
 ### Create Calendar
 
-Choose an account source explicitly; ekctl never guesses an iCloud or local
+Choose an account source explicitly; eventkitcontrol never guesses an iCloud or local
 account:
 
 ```bash
-ekctl list sources
-ekctl calendar create --source SOURCE_ID --title "Project X" --color "#FF5500"
+eventkitcontrol list sources
+eventkitcontrol calendar create --source SOURCE_ID --title "Project X" --color "#FF5500"
 ```
 
 ### Update Calendar
@@ -108,7 +129,7 @@ ekctl calendar create --source SOURCE_ID --title "Project X" --color "#FF5500"
 **Command:**
 
 ```bash
-ekctl calendar update CALENDAR_ID --title "New Name" --color "#00FF00"
+eventkitcontrol calendar update CALENDAR_ID --title "New Name" --color "#00FF00"
 ```
 
 ### Delete Calendar
@@ -116,12 +137,12 @@ ekctl calendar update CALENDAR_ID --title "New Name" --color "#00FF00"
 **Command:**
 
 ```bash
-ekctl calendar delete CALENDAR_ID --dry-run
-ekctl calendar delete CALENDAR_ID --confirm CALENDAR_ID
+eventkitcontrol calendar delete CALENDAR_ID --dry-run
+eventkitcontrol calendar delete CALENDAR_ID --confirm CALENDAR_ID
 ```
 
 Calendar update and deletion operate on event-only calendars. Reminder lists
-are listed separately with `ekctl list reminder-lists` and are not deletable by
+are listed separately with `eventkitcontrol list reminder-lists` and are not deletable by
 this CLI.
 
 ### Aliases
@@ -131,8 +152,8 @@ Use friendly names instead of UUIDs. Aliases work anywhere a calendar ID is acce
 **Set alias:**
 
 ```bash
-ekctl alias set work "CA513B39-1659-4359-8FE9-0C2A3DCEF153"
-ekctl alias set personal "4E367C6F-354B-4811-935E-7F25A1BB7D39"
+eventkitcontrol alias set work "CA513B39-1659-4359-8FE9-0C2A3DCEF153"
+eventkitcontrol alias set personal "4E367C6F-354B-4811-935E-7F25A1BB7D39"
 ```
 
 Use `--dry-run` to securely load the current config and preview an alias's
@@ -141,7 +162,7 @@ before/after value without touching the config file.
 **List aliases:**
 
 ```bash
-ekctl alias list
+eventkitcontrol alias list
 ```
 
 **Output:**
@@ -154,7 +175,7 @@ ekctl alias list
     { "name": "work", "id": "CA513B39-1659-4359-8FE9-0C2A3DCEF153" }
   ],
   "count": 3,
-  "configPath": "/Users/you/.ekctl/config.json",
+  "configPath": "/Users/you/.eventkitcontrol/config.json",
   "status": "success"
 }
 ```
@@ -162,18 +183,18 @@ ekctl alias list
 **Remove alias:**
 
 ```bash
-ekctl alias remove work
+eventkitcontrol alias remove work
 ```
 
 **Usage:**
 
 ```bash
 # These are equivalent:
-ekctl list events --calendar "CA513B39-1659-4359-8FE9-0C2A3DCEF153" --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
-ekctl list events --calendar work --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
+eventkitcontrol list events --calendar "CA513B39-1659-4359-8FE9-0C2A3DCEF153" --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
+eventkitcontrol list events --calendar work --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
 ```
 
-Aliases are stored in `~/.ekctl/config.json`. The directory, lock, and config
+Aliases are stored in `~/.eventkitcontrol/config.json`. The directory, lock, and config
 must be owned by the current user, use private `0700`/`0600` modes, and have no
 extended ACLs; unsafe entries are rejected rather than silently trusted.
 
@@ -184,13 +205,13 @@ extended ACLs; unsafe entries are rejected rather than silently trusted.
 **Command:**
 
 ```bash
-ekctl list events --calendar work --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
+eventkitcontrol list events --calendar work --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
 ```
 
 To fetch events from multiple calendars in a single call, pass a comma-separated list of IDs or aliases. Each event's source calendar is reported in its `calendar` field, so the merged stream is still distinguishable:
 
 ```bash
-ekctl list events --calendar work,personal --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
+eventkitcontrol list events --calendar work,personal --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
 ```
 
 **Filtering:**
@@ -199,13 +220,13 @@ Narrow the result set further with `--search` (case-insensitive substring across
 
 ```bash
 # Just the standup-related events
-ekctl list events --calendar work --from "$NOWISH" --to "$TOMORROW" --search standup
+eventkitcontrol list events --calendar work --from "$NOWISH" --to "$TOMORROW" --search standup
 
 # Only "busy" events — useful for finding actual blocked-out time
-ekctl list events --calendar work --from "$NOWISH" --to "$TOMORROW" --availability busy
+eventkitcontrol list events --calendar work --from "$NOWISH" --to "$TOMORROW" --availability busy
 
 # Combine — standups marked busy
-ekctl list events --calendar work --from "$NOWISH" --to "$TOMORROW" --search standup --availability busy
+eventkitcontrol list events --calendar work --from "$NOWISH" --to "$TOMORROW" --search standup --availability busy
 ```
 
 **Output:**
@@ -242,26 +263,26 @@ Three top-level shortcuts wrap the most common `list events` queries with a pre-
 
 ```bash
 # Events occurring today (local time)
-ekctl today --calendar work
+eventkitcontrol today --calendar work
 
 # Events occurring tomorrow
-ekctl tomorrow --calendar work
+eventkitcontrol tomorrow --calendar work
 
 # The single next upcoming event (looks 90 days ahead by default)
-ekctl next --calendar work
+eventkitcontrol next --calendar work
 
 # The next N events
-ekctl next --calendar work --count 5
+eventkitcontrol next --calendar work --count 5
 
 # Look further out
-ekctl next --calendar work --count 5 --days 365
+eventkitcontrol next --calendar work --count 5 --days 365
 ```
 
 All three accept the same filter / format flags as `list events` (`--search`, `--availability`, `--format`, and comma-separated `--calendar`), so they compose:
 
 ```bash
-ekctl today --calendar work,personal --availability busy --format csv
-ekctl next --calendar work --search standup --count 3 --format text
+eventkitcontrol today --calendar work,personal --availability busy --format csv
+eventkitcontrol next --calendar work --search standup --count 3 --format text
 ```
 
 `next` returns events sorted by start time ascending and includes events that are currently in progress (their `endDate` is still in the future).
@@ -271,7 +292,7 @@ ekctl next --calendar work --search standup --count 3 --format text
 **Command:**
 
 ```bash
-ekctl show event EVENT_ID
+eventkitcontrol show event EVENT_ID
 ```
 
 For a recurring event, copy both values from its JSON `selector` object. An ID
@@ -279,7 +300,7 @@ alone is deliberately rejected because EventKit otherwise resolves an arbitrary
 occurrence:
 
 ```bash
-ekctl show event EVENT_ID \
+eventkitcontrol show event EVENT_ID \
   --occurrence "2026-02-12T18:00:00Z" \
   --expected-start "2026-02-12T18:00:00Z"
 ```
@@ -289,13 +310,13 @@ ekctl show event EVENT_ID \
 Basic event:
 
 ```bash
-ekctl add event --calendar work --title "Lunch" --start "2026-02-10T12:30:00Z" --end "2026-02-10T13:30:00Z"
+eventkitcontrol add event --calendar work --title "Lunch" --start "2026-02-10T12:30:00Z" --end "2026-02-10T13:30:00Z"
 ```
 
 With location, notes, and alarms:
 
 ```bash
-ekctl add event \
+eventkitcontrol add event \
   --calendar work \
   --title "Project Review" \
   --start "2026-02-15T14:00:00Z" \
@@ -308,7 +329,7 @@ ekctl add event \
 Recurring event (weekly):
 
 ```bash
-ekctl add event \
+eventkitcontrol add event \
   --calendar personal \
   --title "Gym" \
   --start "2026-02-12T18:00:00Z" \
@@ -325,7 +346,7 @@ Geocoding is off by default. Opt in only when you want location text sent to
 Apple's geocoder:
 
 ```bash
-ekctl add event \
+eventkitcontrol add event \
   --calendar work \
   --title "Client Site Visit" \
   --start "2026-02-20T14:00:00Z" \
@@ -361,7 +382,7 @@ ekctl add event \
 All flags are optional — only the fields you pass will be changed:
 
 ```bash
-ekctl update event EVENT_ID --title "New title"
+eventkitcontrol update event EVENT_ID --title "New title"
 ```
 
 Date changes are the exception: supply `--start`, `--end`, and
@@ -381,7 +402,7 @@ units cannot be mistaken for reusable `--alarms` input.
 With multiple fields:
 
 ```bash
-ekctl update event EVENT_ID \
+eventkitcontrol update event EVENT_ID \
   --title "Updated title" \
   --start "2026-02-15T14:00:00Z" \
   --end "2026-02-15T15:30:00Z" \
@@ -422,8 +443,8 @@ ekctl update event EVENT_ID \
 **Command:**
 
 ```bash
-ekctl delete event EVENT_ID --dry-run
-ekctl delete event EVENT_ID --yes
+eventkitcontrol delete event EVENT_ID --dry-run
+eventkitcontrol delete event EVENT_ID --yes
 ```
 
 **Output:**
@@ -443,25 +464,25 @@ ekctl delete event EVENT_ID --yes
 All reminders:
 
 ```bash
-ekctl list reminders --list personal
+eventkitcontrol list reminders --list personal
 ```
 
 Only incomplete:
 
 ```bash
-ekctl list reminders --list personal --completed false
+eventkitcontrol list reminders --list personal --completed false
 ```
 
 Only completed:
 
 ```bash
-ekctl list reminders --list personal --completed true
+eventkitcontrol list reminders --list personal --completed true
 ```
 
 Substring filter on title and notes:
 
 ```bash
-ekctl list reminders --list personal --search milk
+eventkitcontrol list reminders --list personal --search milk
 ```
 
 **Output:**
@@ -492,7 +513,7 @@ ekctl list reminders --list personal --search milk
 **Command:**
 
 ```bash
-ekctl show reminder REMINDER_ID
+eventkitcontrol show reminder REMINDER_ID
 ```
 
 ### Add Reminder
@@ -500,19 +521,19 @@ ekctl show reminder REMINDER_ID
 Simple reminder:
 
 ```bash
-ekctl add reminder --list personal --title "Call dentist"
+eventkitcontrol add reminder --list personal --title "Call dentist"
 ```
 
 With due date:
 
 ```bash
-ekctl add reminder --list personal --title "Submit expense report" --due "2026-01-25T09:00:00Z"
+eventkitcontrol add reminder --list personal --title "Submit expense report" --due "2026-01-25T09:00:00Z"
 ```
 
 With priority and notes (priority: 0=none, 1=high, 5=medium, 9=low):
 
 ```bash
-ekctl add reminder \
+eventkitcontrol add reminder \
   --list groceries \
   --title "Buy milk" \
   --due "2026-02-01T12:00:00Z" \
@@ -546,20 +567,20 @@ ekctl add reminder \
 **Command:**
 
 ```bash
-ekctl update reminder REMINDER_ID --title "New title" --due "2026-02-01T09:00:00Z" --priority 1 --notes "Updated notes"
+eventkitcontrol update reminder REMINDER_ID --title "New title" --due "2026-02-01T09:00:00Z" --priority 1 --notes "Updated notes"
 ```
 
 All flags are optional — only the fields you pass will be changed:
 
 ```bash
 # Just change the title
-ekctl update reminder REMINDER_ID --title "Renamed reminder"
+eventkitcontrol update reminder REMINDER_ID --title "Renamed reminder"
 
 # Bump priority and add a due date
-ekctl update reminder REMINDER_ID --priority 1 --due "2026-03-10T09:00:00Z"
+eventkitcontrol update reminder REMINDER_ID --priority 1 --due "2026-03-10T09:00:00Z"
 
 # Mark as completed via update (same effect as complete command)
-ekctl update reminder REMINDER_ID --completed true
+eventkitcontrol update reminder REMINDER_ID --completed true
 ```
 
 **Output:**
@@ -588,7 +609,7 @@ ekctl update reminder REMINDER_ID --completed true
 **Command:**
 
 ```bash
-ekctl complete reminder REMINDER_ID
+eventkitcontrol complete reminder REMINDER_ID
 ```
 
 **Output:**
@@ -611,8 +632,8 @@ ekctl complete reminder REMINDER_ID
 **Command:**
 
 ```bash
-ekctl delete reminder REMINDER_ID --dry-run
-ekctl delete reminder REMINDER_ID --yes
+eventkitcontrol delete reminder REMINDER_ID --dry-run
+eventkitcontrol delete reminder REMINDER_ID --yes
 ```
 
 ## Date Format
@@ -632,11 +653,11 @@ Timestamps in **output** are rendered in your local timezone and are always vali
 - `--time-format rfc3339` (default): colon-separated offset, `Z` for UTC — `2026-01-15T20:00:00+11:00`
 - `--time-format compact`: no colon, and `+0000` instead of `Z` — `2026-01-15T20:00:00+1100`
 
-`compact` exists because jq's `strptime` understands the `%z` offset form (`+1100`) but not the colon-separated `%:z` form (`+11:00`), so it can post-process ekctl timestamps directly:
+`compact` exists because jq's `strptime` understands the `%z` offset form (`+1100`) but not the colon-separated `%:z` form (`+11:00`), so it can post-process eventkitcontrol timestamps directly:
 
 ```bash
 # "09:00AM Standup" — the next 5 events with 12-hour start times
-ekctl next --calendar work --count 5 --time-format compact |
+eventkitcontrol next --calendar work --count 5 --time-format compact |
   jq -r '.events[] | "\(.startDate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%I:%M%p")) \(.title)"'
 ```
 
@@ -669,24 +690,24 @@ text output renders terminal control characters visibly.
 ### Get calendar ID by name
 
 ```bash
-CALENDAR_ID=$(ekctl list calendars | jq -r '.calendars[] | select(.title == "Work") | .id')
+CALENDAR_ID=$(eventkitcontrol list calendars | jq -r '.calendars[] | select(.title == "Work") | .id')
 echo $CALENDAR_ID
 ```
 
 ### List today's events
 
 ```bash
-ekctl today --calendar "$CALENDAR_ID"
+eventkitcontrol today --calendar "$CALENDAR_ID"
 ```
 
 The `today` / `tomorrow` / `next` subcommands work out the date range locally so you don't have to wrangle `date -v+1d` (which is BSD-only and breaks under Linux), and they accept the same `--search`, `--availability`, and `--format` flags as `list events`:
 
 ```bash
 # Tomorrow's busy meetings as CSV
-ekctl tomorrow --calendar work --availability busy --format csv
+eventkitcontrol tomorrow --calendar work --availability busy --format csv
 
 # Next 3 events that mention "standup"
-ekctl next --calendar work --count 3 --search standup
+eventkitcontrol next --calendar work --count 3 --search standup
 ```
 
 `next --days` accepts 1 through 1461 days, keeping EventKit queries and date
@@ -700,7 +721,7 @@ TITLE="Sprint Planning"
 START="2026-01-20T10:00:00Z"
 END="2026-01-20T11:00:00Z"
 
-ekctl add event \
+eventkitcontrol add event \
   --calendar "$CALENDAR_ID" \
   --title "$TITLE" \
   --start "$START" \
@@ -710,7 +731,7 @@ ekctl add event \
 ### Count incomplete reminders
 
 ```bash
-ekctl list reminders --list "$LIST_ID" --completed false | jq '.count'
+eventkitcontrol list reminders --list "$LIST_ID" --completed false | jq '.count'
 ```
 
 ### Export events to CSV
@@ -718,7 +739,7 @@ ekctl list reminders --list "$LIST_ID" --completed false | jq '.count'
 Use the built-in `--format csv` flag — no jq pipeline required. The CSV header is the union of every field across the returned events, so new fields like `availability` and `attendees` are picked up automatically as they're added:
 
 ```bash
-ekctl list events \
+eventkitcontrol list events \
   --calendar "$CALENDAR_ID" \
   --from "2026-01-01T00:00:00Z" \
   --to "2026-12-31T23:59:59Z" \
@@ -733,7 +754,7 @@ Nested objects flatten to dot-notated columns (e.g., `calendar.id`, `calendar.ti
 `--format text` emits one `key: value` line per field, with a blank line between items — handy for `grep`, eyeballing, or quick `head`/`tail` checks:
 
 ```bash
-ekctl list events --calendar work --from "$TODAY" --to "$TOMORROW" --format text
+eventkitcontrol list events --calendar work --from "$TODAY" --to "$TOMORROW" --format text
 ```
 
 ## Error Handling
@@ -753,7 +774,7 @@ JSON errors include a stable code and the corresponding process exit status:
 Common errors:
 
 - `Permission denied`: Grant access in System Settings → Privacy & Security → Calendars/Reminders
-- `Calendar not found`: Check calendar ID with `ekctl list calendars`
+- `Calendar not found`: Check calendar ID with `eventkitcontrol list calendars`
 - `Invalid date format`: Use ISO 8601 (e.g., `2026-01-15T09:00:00Z`, `+10:00`, or `+1000` offsets — see [Date Format](#date-format))
 
 Exit codes: `0` success, `1` failure, `2` permission denied, `64` invalid usage (bad flags/values).
@@ -761,22 +782,22 @@ Exit codes: `0` success, `1` failure, `2` permission denied, `64` invalid usage 
 ## Help
 
 ```bash
-ekctl --help
-ekctl list --help
-ekctl add event --help
+eventkitcontrol --help
+eventkitcontrol list --help
+eventkitcontrol add event --help
 ```
 
 ## License
 
-MIT License
+[MIT](LICENSE)
 
 ## Contributing
 
 Pull requests welcome.
 
-## Who made this?
+## Project lineage
 
-ekctl was made by [Marcus Schappi](https://twitter.com/schappim). I create software (and even hardware) for real-world businesses, including:
-
-* **[Little Bird Electronics](https://littlebirdelectronics.com.au/)** — Australia's electronics and STEM store, shipping Australia-wide. We sell [Arduino](https://littlebirdelectronics.com.au/collections/arduino), [Raspberry Pi](https://littlebirdelectronics.com.au/collections/raspberry-pi), [micro:bit](https://littlebirdelectronics.com.au/collections/micro-bit), [STEM and STEAM education kits](https://littlebirdelectronics.com.au/collections/stem-education), [e-textiles](https://littlebirdelectronics.com.au/collections/e-textiles), [robotics](https://littlebirdelectronics.com.au/collections/robotics), [sensors](https://littlebirdelectronics.com.au/collections/sensors) and [electronic components](https://littlebirdelectronics.com.au/collections/components).
-* **[Struth.app](https://struth.app/)** — AI runs and grows your trade business. The Struth platform is field service management + CRM + AI.
+eventkitcontrol began as a fork of
+[ekctl](https://github.com/schappim/ekctl), originally created by Marcus Schappi.
+It now has its own command, configuration, bundle identity, and distribution and
+does not maintain binary or command compatibility with upstream.

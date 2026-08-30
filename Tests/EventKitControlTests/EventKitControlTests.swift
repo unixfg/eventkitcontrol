@@ -1,21 +1,18 @@
 import ArgumentParser
 import EventKit
-import XCTest
-import ekctlCore
+import EventKitControlCore
 import Foundation
+import XCTest
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Test-only helpers ─────────────────────────────────────────────────────────
-// These small functions mirror the inline logic inside run() methods in Ekctl.swift. 
-// They can't be imported because they live in the executable target, so we keep slim wrappers here. 
-// Each one exactly matches the production code — if the production code changes, the behaviour test will catch the drift.
+// These thin wrappers call the production validation APIs while expressing the
+// optional-value behavior used by command flags.
 
-/// Mirrors: parseDateOption() in Ekctl.swift, which delegates to the real
-/// `DateParsing.parse` — so unlike the other mirrors this one exercises the
-/// actual production parser.
+/// Exercises the production date parser.
 func validateDate(_ input: String) -> Date? {
     DateParsing.parse(input)
 }
@@ -26,10 +23,10 @@ func parsePriority(_ string: String?) -> Int? {
     return try? InputValidation.parsePriority(string)
 }
 
-/// The real shared implementation used by AddEvent.run() / UpdateEvent.run()
-/// — no longer a mirror.
+/// Exercises the production alarm parser.
 func parseAlarms(_ string: String?) -> [Double]? {
-    AlarmParsing.parse(string)
+    guard let string else { return nil }
+    return try? AlarmParsing.parseRequired(string)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -299,8 +296,7 @@ final class OutputFormatTests: XCTestCase {
         XCTAssertTrue(csv.contains("shows up automatically"))
     }
 
-    /// Explicit regression guard for the two fields the maintainer specifically
-    /// worried about (`availability` from issue #2 and `attendees` from PR #6).
+    /// Explicit regression guard for representative scalar and nested fields.
     /// Both must round-trip through CSV without any per-field code.
     func testCSVIncludesAvailabilityAndAttendeesAutomatically() {
         let events: [[String: Any]] = [[
@@ -776,7 +772,7 @@ final class ConfigManagerTests: XCTestCase {
     override func setUpWithError() throws {
         try super.setUpWithError()
         containerURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ekctl-config-tests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("eventkitcontrol-config-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(
             at: containerURL,
             withIntermediateDirectories: false,
@@ -882,20 +878,28 @@ final class ConfigManagerTests: XCTestCase {
 
     func testProductionStoreUsesAbsoluteEnvironmentOverride() throws {
         let production = try ConfigStore.production(
-            environment: ["EKCTL_CONFIG_DIR": rootURL.path])
+            environment: ["EVENTKITCONTROL_CONFIG_DIR": rootURL.path])
         XCTAssertEqual(production.directoryURL, rootURL.standardizedFileURL)
         XCTAssertThrowsError(
-            try ConfigStore.production(environment: ["EKCTL_CONFIG_DIR": "relative/path"]))
+            try ConfigStore.production(environment: ["EVENTKITCONTROL_CONFIG_DIR": "relative/path"]))
         XCTAssertThrowsError(
-            try ConfigStore.production(environment: ["EKCTL_CONFIG_DIR": "/"]))
+            try ConfigStore.production(environment: ["EVENTKITCONTROL_CONFIG_DIR": "/"]))
         XCTAssertThrowsError(
             try ConfigStore(rootURL: URL(fileURLWithPath: "/private/tmp/../..", isDirectory: true)))
+    }
+
+    func testProductionStoreUsesIndependentEventKitControlNamespace() throws {
+        let production = try ConfigStore.production(environment: [:])
+        let expected = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".eventkitcontrol", isDirectory: true)
+            .standardizedFileURL
+        XCTAssertEqual(production.directoryURL, expected)
     }
 
     func testProductionOverrideRejectsBroadOrUnrelatedExistingDirectory() throws {
         XCTAssertThrowsError(try ConfigStore.production(
             environment: [
-                "EKCTL_CONFIG_DIR": FileManager.default.homeDirectoryForCurrentUser.path,
+                "EVENTKITCONTROL_CONFIG_DIR": FileManager.default.homeDirectoryForCurrentUser.path,
             ]
         ))
 
@@ -908,7 +912,7 @@ final class ConfigManagerTests: XCTestCase {
         try Data("do not touch".utf8).write(to: unrelated)
 
         XCTAssertThrowsError(try ConfigStore.production(
-            environment: ["EKCTL_CONFIG_DIR": rootURL.path]
+            environment: ["EVENTKITCONTROL_CONFIG_DIR": rootURL.path]
         ))
         XCTAssertEqual(try Data(contentsOf: unrelated), Data("do not touch".utf8))
     }
@@ -1121,8 +1125,9 @@ final class ConfigManagerTests: XCTestCase {
 
         let errors = ErrorCollector()
         let group = DispatchGroup()
+        let concurrentStore = store
         let queue = DispatchQueue(
-            label: "ekctl.config.concurrent-tests",
+            label: "eventkitcontrol.config.concurrent-tests",
             attributes: .concurrent
         )
 
@@ -1131,7 +1136,7 @@ final class ConfigManagerTests: XCTestCase {
             queue.async {
                 defer { group.leave() }
                 do {
-                    try self.store.setAlias(name: "alias-\(index)", id: "CAL-\(index)")
+                    try concurrentStore.setAlias(name: "alias-\(index)", id: "CAL-\(index)")
                 } catch {
                     errors.append(error)
                 }
@@ -1279,7 +1284,7 @@ final class HexColorTests: XCTestCase {
 
 final class DateValidationTests: XCTestCase {
 
-    // ── Formats ekctl actually accepts ───────────────────────────────────────
+    // ── Formats eventkitcontrol actually accepts ─────────────────────────────
 
     func testUTCFormatIsAccepted() {
         XCTAssertNotNil(validateDate("2026-02-15T14:00:00Z"))
@@ -1290,14 +1295,14 @@ final class DateValidationTests: XCTestCase {
         XCTAssertNotNil(validateDate("2026-02-15T14:00:00+08:00"))
     }
 
-    // ── Formats ekctl rejects ─────────────────────────────────────────────────
+    // ── Formats eventkitcontrol rejects ───────────────────────────────────────
 
     func testHumanReadableDateIsRejected() {
         XCTAssertNil(validateDate("March 5 2026"))
     }
 
     func testDateOnlyWithoutTimeIsRejected() {
-        // Missing time component — ekctl requires full ISO8601 datetime
+        // Missing time component — eventkitcontrol requires a full ISO8601 datetime
         XCTAssertNil(validateDate("2026-03-05"))
     }
 
@@ -1432,8 +1437,7 @@ final class UpdateReminderLogicTests: XCTestCase {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Tests for `AvailabilitySetting` — the `--availability` value on
-/// `add event` / `update event`. Previously a raw String that was silently
-/// ignored when misspelled; now ArgumentParser rejects unknown values.
+/// `add event` / `update event`. ArgumentParser must reject unknown values.
 final class AvailabilitySettingTests: XCTestCase {
 
     func testParsesAllKnownValues() {
@@ -1444,7 +1448,7 @@ final class AvailabilitySettingTests: XCTestCase {
     }
 
     func testParsingIsCaseInsensitive() {
-        // The old string-based flag lowercased input; keep that leniency.
+        // Command values intentionally parse case-insensitively.
         XCTAssertEqual(AvailabilitySetting(argument: "BUSY"), .busy)
         XCTAssertEqual(AvailabilitySetting(argument: "Tentative"), .tentative)
     }
@@ -1467,9 +1471,9 @@ final class AvailabilitySettingTests: XCTestCase {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Tests for `TimeFormat` — the `--time-format` flag's rendering patterns
-/// (issue #3). `rfc3339` must stay byte-identical to the historical output;
-/// `compact` must always produce a numeric offset jq's `%z` can parse.
+/// Tests for the `--time-format` flag's rendering patterns. `rfc3339` uses a
+/// colon-separated offset or `Z`; `compact` always produces a numeric offset
+/// that jq's `%z` can parse.
 final class TimeFormatTests: XCTestCase {
 
     /// 2026-01-01T00:00:00Z rendered through `timeFormat` in `zone` — mirrors
@@ -1491,7 +1495,7 @@ final class TimeFormatTests: XCTestCase {
     }
 
     func testUTCRendering() {
-        // rfc3339 keeps the historical `Z`; compact must render `+0000`
+        // rfc3339 uses `Z`; compact must render `+0000`
         // because a literal `Z` is exactly what breaks jq's `%z`.
         XCTAssertEqual(render(.rfc3339, zone: "UTC"), "2026-01-01T00:00:00Z")
         XCTAssertEqual(render(.compact, zone: "UTC"), "2026-01-01T00:00:00+0000")
@@ -1512,7 +1516,7 @@ final class TimeFormatTests: XCTestCase {
                 let emitted = render(timeFormat, zone: zone)
                 XCTAssertNotNil(
                     DateParsing.parse(emitted),
-                    "\(timeFormat.rawValue) output \(emitted) must be valid ekctl input")
+                    "\(timeFormat.rawValue) output \(emitted) must be valid eventkitcontrol input")
             }
         }
     }
@@ -1521,11 +1525,11 @@ final class TimeFormatTests: XCTestCase {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Tests for `DateParsing.parse` — the shared parser behind every date-taking
-/// flag. The defining property (issue #3): anything ekctl can emit must parse
-/// back in, in both the colon (`+11:00`) and compact (`+1100`) offset forms.
+/// flag. Anything eventkitcontrol emits must parse back in, in both the colon
+/// (`+11:00`) and compact (`+1100`) offset forms.
 final class DateParsingTests: XCTestCase {
 
-    // ── Accepted: RFC 3339 / colon offsets (original behaviour) ──────────────
+    // ── Accepted: RFC 3339 / colon offsets ───────────────────────────────────
 
     func testParsesUTCZuluForm() {
         XCTAssertEqual(
@@ -1537,7 +1541,7 @@ final class DateParsingTests: XCTestCase {
         XCTAssertNotNil(DateParsing.parse("2026-03-09T16:00:00-04:00"))
     }
 
-    // ── Accepted: compact offsets (issue #3) ─────────────────────────────────
+    // ── Accepted: compact offsets ────────────────────────────────────────────
 
     func testParsesCompactOffset() {
         XCTAssertNotNil(DateParsing.parse("2026-03-09T16:00:00-0400"))
@@ -1566,7 +1570,7 @@ final class DateParsingTests: XCTestCase {
         XCTAssertNil(DateParsing.parse("2026-03-05"))  // date-only — no time
     }
 
-    // ── Round-trip: every form ekctl can emit is valid ekctl input ────────────
+    // ── Round-trip: every form eventkitcontrol emits remains valid input ──────
 
     func testEmittedFormatsRoundTrip() {
         // Mirror both timestamp renderings `localDateFormatter` can produce
