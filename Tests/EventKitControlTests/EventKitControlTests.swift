@@ -1125,7 +1125,7 @@ final class ConfigManagerTests: XCTestCase {
 
         let errors = ErrorCollector()
         let group = DispatchGroup()
-        let concurrentStore = store
+        let concurrentStore = try XCTUnwrap(store)
         let queue = DispatchQueue(
             label: "eventkitcontrol.config.concurrent-tests",
             attributes: .concurrent
