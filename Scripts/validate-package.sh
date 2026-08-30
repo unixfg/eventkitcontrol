@@ -255,11 +255,17 @@ allowed_package_attributes = {
 }
 package_attributes = {}
 package_locations = []
+bundle_version_count = 0
 for package_ref in package_refs:
     if package_ref.attrib.get("id") != "io.github.unixfg.eventkitcontrol.pkg":
         fail("Distribution contains a package reference with the wrong identifier")
-    if list(package_ref):
-        fail("Distribution package reference unexpectedly contains child elements")
+    # productbuild preserves pkgbuild's empty non-bundle metadata marker.
+    for child in package_ref:
+        if child.tag != "bundle-version":
+            fail(f"Distribution package reference contains unexpected {child.tag} metadata")
+        if child.attrib or list(child) or (child.text or "").strip():
+            fail("Distribution bundle-version metadata must be empty")
+        bundle_version_count += 1
 
     extra_package_attributes = set(package_ref.attrib) - allowed_package_attributes
     if extra_package_attributes:
@@ -277,6 +283,9 @@ for package_ref in package_refs:
     location = (package_ref.text or "").strip()
     if location:
         package_locations.append(location)
+
+if bundle_version_count > 1:
+    fail("Distribution contains duplicate bundle-version metadata")
 
 required_package_attributes = {
     "id": "io.github.unixfg.eventkitcontrol.pkg",
