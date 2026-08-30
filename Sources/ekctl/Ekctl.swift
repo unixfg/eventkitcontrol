@@ -1,982 +1,1128 @@
 import ArgumentParser
+import Darwin
 import EventKit
 import Foundation
 import ekctlCore
 
-// MARK: - Shared Option Parsing
+// MARK: - Shared command safety
 
-/// Parses a date-flag value via the shared `DateParsing` rules, printing the
-/// standard error payload in the requested output format and failing the
-/// command if the value is unparseable. `flag` names the offending option in
-/// the message (e.g., "--from").
-private func parseDateOption(_ value: String, flag: String, format: OutputFormat) throws -> Date {
+private let invalidInputExit: Int32 = 64
+
+private func writeStderr(_ value: String) {
+    guard let data = (value + "\n").data(using: .utf8) else { return }
+    FileHandle.standardError.write(data)
+}
+
+/// The only path used to render operation results. Failures go to stderr and
+/// terminate with the status embedded in their structured payload.
+private func emit(_ result: JSONOutput, format: OutputFormat) throws {
+    let rendered = result.format(format)
+    if result.isError {
+        writeStderr(rendered)
+        throw ExitCode(rawValue: result.exitStatus)
+    }
+    print(rendered)
+}
+
+private func invalid(_ message: String, format: OutputFormat) throws -> Never {
+    try emit(
+        .error(message, code: "invalid_input", exitCode: invalidInputExit),
+        format: format)
+    fatalError("emit(error:) always throws")
+}
+
+private func operationFailed(_ message: String, format: OutputFormat) throws -> Never {
+    try emit(.error(message), format: format)
+    fatalError("emit(error:) always throws")
+}
+
+private func configFailed(
+    _ error: Error,
+    context: String,
+    format: OutputFormat
+) throws -> Never {
+    if let configError = error as? ConfigStoreError {
+        switch configError {
+        case .invalidAliasName, .invalidAliasID, .invalidCalendarList:
+            try invalid(configError.localizedDescription, format: format)
+        default:
+            break
+        }
+    }
+    try operationFailed("\(context): \(error.localizedDescription)", format: format)
+}
+
+private func requestAccess(
+    _ manager: EventKitManager,
+    _ scope: AccessScope,
+    format: OutputFormat
+) throws {
+    do {
+        try manager.requestAccess(scope)
+    } catch let error as EventKitAccessError {
+        try emit(
+            .error(
+                error.localizedDescription,
+                code: error.errorCode,
+                exitCode: error.exitStatus),
+            format: format)
+    } catch {
+        try operationFailed("EventKit access failed: \(error.localizedDescription)", format: format)
+    }
+}
+
+private func parseTimestamp(_ value: String, flag: String, format: OutputFormat) throws -> Date {
     guard let date = DateParsing.parse(value) else {
-        print(
-            JSONOutput.error("Invalid \(flag) date format. Use \(DateParsing.acceptedFormats).")
-                .format(format))
-        throw ExitCode.failure
+        try invalid("Invalid \(flag). Use \(DateParsing.acceptedFormats).", format: format)
     }
     return date
 }
 
-// MARK: - Main Command
+private func parseLocalDay(_ value: String, flag: String, format: OutputFormat) throws -> Date {
+    guard let day = DateParsing.parseLocalDay(value),
+          let date = day.date(in: .current)
+    else {
+        try invalid("Invalid \(flag). All-day values must use \(DateParsing.allDayFormat).", format: format)
+    }
+    return date
+}
+
+private func parseEventDate(
+    _ value: String,
+    flag: String,
+    allDay: Bool,
+    format: OutputFormat
+) throws -> Date {
+    if allDay { return try parseLocalDay(value, flag: flag, format: format) }
+    return try parseTimestamp(value, flag: flag, format: format)
+}
+
+private func parseSelectorDate(
+    _ value: String,
+    flag: String,
+    format: OutputFormat
+) throws -> Date {
+    if let day = DateParsing.parseLocalDay(value), let date = day.date(in: .current) {
+        return date
+    }
+    return try parseTimestamp(value, flag: flag, format: format)
+}
+
+private func parseAlarms(_ value: String?, format: OutputFormat) throws -> [Double]? {
+    guard let value else { return nil }
+    do {
+        return try AlarmParsing.parseRequired(value)
+    } catch {
+        try invalid("Invalid --alarms: \(error.localizedDescription)", format: format)
+    }
+}
+
+private func parsePriority(
+    _ value: String?,
+    default defaultValue: Int? = nil,
+    format: OutputFormat
+) throws -> Int? {
+    guard let value else { return defaultValue }
+    do {
+        return try InputValidation.parsePriority(value)
+    } catch {
+        try invalid("Invalid --priority: \(error.localizedDescription)", format: format)
+    }
+}
+
+private func validateColor(_ value: String?, format: OutputFormat) throws {
+    guard let value else { return }
+    do {
+        _ = try InputValidation.validateHexColor(value)
+    } catch {
+        try invalid("Invalid --color: \(error.localizedDescription)", format: format)
+    }
+}
+
+private func validateIdentifier(
+    _ value: String,
+    flag: String,
+    format: OutputFormat
+) throws {
+    do {
+        _ = try InputValidation.validateIdentifier(value)
+    } catch {
+        try invalid("Invalid \(flag): \(error.localizedDescription)", format: format)
+    }
+}
+
+private func validateIdentifiers(
+    _ values: [String],
+    flag: String,
+    format: OutputFormat
+) throws {
+    for value in values {
+        try validateIdentifier(value, flag: flag, format: format)
+    }
+}
+
+private func validateURL(_ value: String?, format: OutputFormat) throws {
+    guard let value else { return }
+    guard let components = URLComponents(string: value),
+          let scheme = components.scheme,
+          !scheme.isEmpty,
+          value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+          value.rangeOfCharacter(from: .controlCharacters) == nil,
+          (!["http", "https"].contains(scheme.lowercased()) || components.host?.isEmpty == false)
+    else {
+        try invalid("Invalid --url. Supply an absolute URL with a scheme.", format: format)
+    }
+}
+
+private func validateEventRange(
+    start: Date,
+    end: Date,
+    allDay: Bool,
+    format: OutputFormat
+) throws {
+    guard end > start else {
+        try invalid("--end must be later than --start.", format: format)
+    }
+    if allDay {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        guard calendar.component(.hour, from: start) == 0,
+              calendar.component(.minute, from: start) == 0,
+              calendar.component(.hour, from: end) == 0,
+              calendar.component(.minute, from: end) == 0
+        else {
+            try invalid("All-day boundaries must be local calendar days.", format: format)
+        }
+    }
+}
+
+private func requestedOutputFormat(
+    arguments: [String] = Array(CommandLine.arguments.dropFirst())
+) -> OutputFormat {
+    var selected: OutputFormat = .json
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
+        if argument == "--format", index + 1 < arguments.count,
+           let value = OutputFormat(rawValue: arguments[index + 1])
+        {
+            selected = value
+            index += 2
+            continue
+        }
+        if argument.hasPrefix("--format="),
+           let value = OutputFormat(rawValue: String(argument.dropFirst("--format=".count)))
+        {
+            selected = value
+        }
+        index += 1
+    }
+    return selected
+}
+
+struct MutationOptions: ParsableArguments {
+    @Flag(name: .long, help: "Validate and preview the operation without writing anything.")
+    var dryRun = false
+}
+
+struct OccurrenceOptions: ParsableArguments {
+    @Option(
+        name: .long,
+        help: "Recurring item's original occurrence date (strict timestamp or local YYYY-MM-DD)."
+    )
+    var occurrence: String?
+
+    @Option(
+        name: .long,
+        help: "Occurrence's current expected start (strict timestamp or local YYYY-MM-DD)."
+    )
+    var expectedStart: String?
+
+    func selector(format: OutputFormat) throws -> EventOccurrenceSelector? {
+        switch (occurrence, expectedStart) {
+        case (nil, nil):
+            return nil
+        case let (.some(occurrence), .some(expectedStart)):
+            return EventOccurrenceSelector(
+                occurrenceDate: try parseSelectorDate(
+                    occurrence, flag: "--occurrence", format: format),
+                expectedStart: try parseSelectorDate(
+                    expectedStart, flag: "--expected-start", format: format))
+        default:
+            try invalid(
+                "--occurrence and --expected-start must be supplied together.",
+                format: format)
+        }
+    }
+}
+
+// MARK: - Main command
 
 @main
 struct Ekctl: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ekctl",
-        abstract:
-            "A command-line tool for managing macOS Calendar events and Reminders using EventKit.",
+        abstract: "Safely manage macOS Calendar events and Reminders using EventKit.",
         version: "1.5.0",
         subcommands: [
-            List.self, Show.self, Add.self, Update.self, Delete.self, Complete.self, Alias.self,
-            CalendarCmd.self,
-            Today.self, Tomorrow.self, Next.self,
+            List.self, Show.self, Add.self, Update.self, Delete.self, Complete.self,
+            Alias.self, CalendarCmd.self, Today.self, Tomorrow.self, Next.self,
         ],
         defaultSubcommand: List.self
     )
+
+    static func main() {
+        do {
+            var command = try parseAsRoot()
+            try command.run()
+        } catch let code as ExitCode {
+            Darwin.exit(code.rawValue)
+        } catch {
+            let code = exitCode(for: error)
+            if code.isSuccess {
+                exit(withError: error)
+            }
+            let invalidInput = code == .validationFailure
+            let status: Int32 = invalidInput ? invalidInputExit : 1
+            let output = JSONOutput.error(
+                message(for: error),
+                code: invalidInput ? "invalid_input" : "operation_failed",
+                exitCode: status)
+            writeStderr(output.format(requestedOutputFormat()))
+            Darwin.exit(status)
+        }
+    }
 }
 
-// MARK: - List Commands
+// MARK: - List commands
 
 struct List: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "List calendars, events, or reminders.",
-        subcommands: [ListCalendars.self, ListEvents.self, ListReminders.self]
+        abstract: "List EventKit objects.",
+        subcommands: [
+            ListCalendars.self, ListReminderLists.self, ListSources.self,
+            ListEvents.self, ListReminders.self,
+        ]
     )
 }
 
 struct ListCalendars: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "calendars",
-        abstract: "List all calendars and reminder lists."
-    )
-
+        commandName: "calendars", abstract: "List event calendars.")
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.all, format: outputFormat.format)
-        let result = manager.listCalendars()
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(manager.listCalendars(), format: outputFormat.format)
+    }
+}
+
+struct ListReminderLists: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "reminder-lists", abstract: "List reminder lists.")
+    @OptionGroup var outputFormat: OutputFormatOptions
+
+    func run() throws {
+        let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
+        try requestAccess(manager, .reminders, format: outputFormat.format)
+        try emit(manager.listReminderLists(), format: outputFormat.format)
+    }
+}
+
+struct ListSources: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "sources",
+        abstract: "List account sources and IDs available for event-calendar creation.")
+    @OptionGroup var outputFormat: OutputFormatOptions
+
+    func run() throws {
+        let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(manager.listSources(), format: outputFormat.format)
     }
 }
 
 struct ListEvents: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "events",
-        abstract: "List events in a calendar within a date range."
-    )
+        abstract: "List events in one or more calendars within a date range.")
 
-    @Option(
-        name: .long,
-        help:
-            "Calendar ID or alias. Pass multiple comma-separated values to fetch events from several calendars (e.g., work,personal). Each event's source calendar is reported in its JSON output."
-    )
+    @Option(name: .long, help: "Calendar ID or alias; comma-separate multiple values.")
     var calendar: String
-
-    @Option(name: .long, help: "Start date in \(DateParsing.acceptedFormats).")
-    var from: String
-
-    @Option(name: .long, help: "End date in \(DateParsing.acceptedFormats).")
-    var to: String
-
-    @Option(
-        name: .long,
-        help: "Case-insensitive substring filter applied across title, location, and notes."
-    )
+    @Option(name: .long, help: "Start in \(DateParsing.acceptedFormats).") var from: String
+    @Option(name: .long, help: "End in \(DateParsing.acceptedFormats).") var to: String
+    @Option(name: .long, help: "Case-insensitive title, location, and notes search.")
     var search: String?
-
-    @Option(
-        name: .long,
-        help: "Filter events by EventKit availability (busy, free, tentative, unavailable, notSupported)."
-    )
-    var availability: AvailabilityFilter?
-
+    @Option(name: .long, help: "Availability filter.") var availability: AvailabilityFilter?
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        // Validate arguments before triggering the TCC permission prompt.
-        let startDate = try parseDateOption(from, flag: "--from", format: outputFormat.format)
-        let endDate = try parseDateOption(to, flag: "--to", format: outputFormat.format)
-        let calendarIDs = ConfigManager.resolveCalendarIDs(calendar)
-
+        let start = try parseTimestamp(from, flag: "--from", format: outputFormat.format)
+        let end = try parseTimestamp(to, flag: "--to", format: outputFormat.format)
+        guard end > start else {
+            try invalid("--to must be later than --from.", format: outputFormat.format)
+        }
+        guard DateRanges.isSupportedEventQuery(start: start, end: end) else {
+            try invalid(
+                "Event query ranges must not exceed \(DateRanges.maximumNextWindowDays) days.",
+                format: outputFormat.format)
+        }
+        let calendarIDs: [String]
+        do {
+            calendarIDs = try ConfigManager.resolveCalendarIDsThrowing(calendar)
+        } catch {
+            try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
+        }
+        try validateIdentifiers(calendarIDs, flag: "--calendar", format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.events, format: outputFormat.format)
-
-        let result = manager.listEvents(
-            calendarIDs: calendarIDs,
-            from: startDate,
-            to: endDate,
-            search: search,
-            availability: availability)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(
+            manager.listEvents(
+                calendarIDs: calendarIDs,
+                from: start,
+                to: end,
+                search: search,
+                availability: availability),
+            format: outputFormat.format)
     }
 }
 
 struct ListReminders: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "reminders",
-        abstract: "List reminders in a reminder list."
-    )
-
-    @Option(name: .long, help: "The reminder list ID or alias.")
-    var list: String
-
-    @Option(name: .long, help: "Filter by completion status (true/false).")
-    var completed: Bool?
-
-    @Option(
-        name: .long,
-        help: "Case-insensitive substring filter applied across title and notes."
-    )
-    var search: String?
-
+        commandName: "reminders", abstract: "List reminders in one reminder list.")
+    @Option(name: .long, help: "Reminder-list ID or alias.") var list: String
+    @Option(name: .long, help: "Filter by completion status.") var completed: Bool?
+    @Option(name: .long, help: "Case-insensitive title and notes search.") var search: String?
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
+        let listID: String
+        do {
+            listID = try ConfigManager.resolveAliasThrowing(list)
+        } catch {
+            try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
+        }
+        try validateIdentifier(listID, flag: "--list", format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.reminders, format: outputFormat.format)
-        let listID = ConfigManager.resolveAlias(list)
-        let result = manager.listReminders(listID: listID, completed: completed, search: search)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .reminders, format: outputFormat.format)
+        try emit(
+            manager.listReminders(listID: listID, completed: completed, search: search),
+            format: outputFormat.format)
     }
 }
 
-// MARK: - Show Commands
+// MARK: - Show commands
 
 struct Show: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Show details of a specific item.",
-        subcommands: [ShowEvent.self, ShowReminder.self]
-    )
+        abstract: "Show one item.", subcommands: [ShowEvent.self, ShowReminder.self])
 }
 
 struct ShowEvent: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "event",
-        abstract: "Show details of a specific event."
-    )
-
-    @Argument(help: "The event ID to show.")
-    var eventID: String
-
+    static let configuration = CommandConfiguration(commandName: "event")
+    @Argument(help: "Event identifier.") var eventID: String
+    @OptionGroup var occurrence: OccurrenceOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
+        try validateIdentifier(eventID, flag: "event ID", format: outputFormat.format)
+        let selector = try occurrence.selector(format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.events, format: outputFormat.format)
-        let result = manager.showEvent(eventID: eventID)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(manager.showEvent(eventID: eventID, selector: selector), format: outputFormat.format)
     }
 }
 
 struct ShowReminder: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "reminder",
-        abstract: "Show details of a specific reminder."
-    )
-
-    @Argument(help: "The reminder ID to show.")
-    var reminderID: String
-
+    static let configuration = CommandConfiguration(commandName: "reminder")
+    @Argument(help: "Reminder identifier.") var reminderID: String
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
+        try validateIdentifier(reminderID, flag: "reminder ID", format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.reminders, format: outputFormat.format)
-        let result = manager.showReminder(reminderID: reminderID)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .reminders, format: outputFormat.format)
+        try emit(manager.showReminder(reminderID: reminderID), format: outputFormat.format)
     }
 }
 
-// MARK: - Add Commands
+// MARK: - Add commands
 
 struct Add: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Add a new event or reminder.",
-        subcommands: [AddEvent.self, AddReminder.self]
-    )
+        abstract: "Create an item.", subcommands: [AddEvent.self, AddReminder.self])
 }
 
 struct AddEvent: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "event",
-        abstract: "Create a new calendar event."
-    )
+    static let configuration = CommandConfiguration(commandName: "event")
 
-    @Option(name: .long, help: "The calendar ID or alias.")
-    var calendar: String
-
-    @Option(name: .long, help: "The event title.")
-    var title: String
-
-    @Option(name: .long, help: "Start date in \(DateParsing.acceptedFormats).")
-    var start: String
-
-    @Option(name: .long, help: "End date in \(DateParsing.acceptedFormats).")
+    @Option(name: .long, help: "Event-calendar ID or alias.") var calendar: String
+    @Option(name: .long, help: "Event title.") var title: String
+    @Option(name: .long, help: "Timed timestamp, or YYYY-MM-DD with --all-day.") var start: String
+    @Option(name: .long, help: "Timed end, or exclusive YYYY-MM-DD boundary with --all-day.")
     var end: String
+    @Option(name: .long, help: "Location text.") var location: String?
+    @Option(name: .long, help: "Notes.") var notes: String?
+    @Flag(name: .long, help: "Require date-only start/end values.") var allDay = false
 
-    @Option(name: .long, help: "Optional location.")
-    var location: String?
-
-    @Option(name: .long, help: "Optional notes.")
-    var notes: String?
-
-    @Flag(name: .long, help: "Mark as all-day event.")
-    var allDay: Bool = false
-
-    // MARK: - Recurrence & Travel Time
-
-    @Option(name: .long, help: "Recurrence frequency (daily, weekly, monthly).")
+    @Option(name: .long, help: "daily, weekly, monthly, or yearly.")
     var recurrenceFrequency: String?
-
-    @Option(name: .long, help: "Recurrence interval (default: 1).")
-    var recurrenceInterval: String?
-
-    @Option(name: .long, help: "Recurrence end count.")
-    var recurrenceEndCount: String?
-
-    @Option(name: .long, help: "Recurrence end date in \(DateParsing.acceptedFormats).")
+    @Option(name: .long, help: "Positive recurrence interval.") var recurrenceInterval: String?
+    @Option(name: .long, help: "Positive occurrence count.") var recurrenceEndCount: String?
+    @Option(name: .long, help: "Strict timestamp, or YYYY-MM-DD for all-day events.")
     var recurrenceEndDate: String?
-
-    @Option(
-        name: .long,
-        help: "Days of week (e.g., 'mon,tue', '1mon' for 1st Monday, '-1fri' for last Friday).")
+    @Flag(name: .long, help: "Explicitly create an unbounded recurrence.")
+    var recurrenceNoEnd = false
+    @Option(name: .long, help: "Comma-separated weekdays, optionally with ordinals.")
     var recurrenceDays: String?
-
-    @Option(name: .long, help: "Months of the year (comma-separated: 1-12 or jan,feb...).")
+    @Option(name: .long, help: "Comma-separated month numbers or names.")
     var recurrenceMonths: String?
-
-    @Option(name: .long, help: "Days of the month (comma-separated: 1-31 or -1 for last).")
+    @Option(name: .long, help: "Comma-separated signed month days.")
     var recurrenceDaysOfMonth: String?
-
-    @Option(name: .long, help: "Weeks of the year (comma-separated: 1-53 or -1 for last).")
+    @Option(name: .long, help: "Comma-separated signed year weeks.")
     var recurrenceWeeksOfYear: String?
-
-    @Option(name: .long, help: "Days of the year (comma-separated: 1-366 or -1 for last).")
+    @Option(name: .long, help: "Comma-separated signed year days.")
     var recurrenceDaysOfYear: String?
-
-    @Option(name: .long, help: "Set positions (comma-separated: 1 for 1st, -1 for last, etc.).")
+    @Option(name: .long, help: "Comma-separated signed set positions.")
     var recurrenceSetPositions: String?
 
-    @Option(name: .long, help: "Travel time in minutes.")
-    var travelTime: String?
-
-    // MARK: - New Features (Alarms, Availability, URL, etc.)
-
-    @Option(
-        name: .long,
-        help:
-            "Alarms in minutes. Positive numbers mean minutes before (e.g., 10). Prefix '+' for minutes after (e.g., +10). Negative numbers are accepted."
-    )
+    @Option(name: .long, help: "Alarm minutes: bare positive/negative are before; explicit + is after.")
     var alarms: String?
-
-    @Option(name: .long, help: "URL for the event.")
-    var url: String?
-
-    @Option(name: .long, help: "Availability (busy, free, tentative, unavailable).")
-    var availability: AvailabilitySetting?
-
+    @Option(name: .long, help: "Absolute event URL.") var url: String?
+    @Option(name: .long, help: "Event availability.") var availability: AvailabilitySetting?
+    @Flag(name: .long, help: "Opt in to sending --location to Apple's geocoder before saving.")
+    var geocodeLocation = false
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        // Validate arguments before triggering the TCC permission prompt.
-        let startDate = try parseDateOption(start, flag: "--start", format: outputFormat.format)
-        let endDate = try parseDateOption(end, flag: "--end", format: outputFormat.format)
-
-        var rEndDate: Date?
-        if let recEndDateString = recurrenceEndDate, !recEndDateString.isEmpty {
-            rEndDate = try parseDateOption(
-                recEndDateString, flag: "--recurrence-end-date", format: outputFormat.format)
+        guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            try invalid("--title must not be empty.", format: outputFormat.format)
         }
-
-        // Parse recurrence interval (default to 1)
-        let recurrenceIntervalInt = (recurrenceInterval.flatMap(Int.init)) ?? 1
-
-        let recurrenceEndCountInt = recurrenceEndCount.flatMap(Int.init)
-
-        // Convert travel time to seconds if provided and valid
-        var travelTimeSeconds: TimeInterval?
-        if let ttString = travelTime, let ttInt = Int(ttString) {
-            travelTimeSeconds = TimeInterval(ttInt * 60)
+        if geocodeLocation && location?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            try invalid("--geocode-location requires a non-empty --location.", format: outputFormat.format)
         }
-
-        // Helper to parse comma-separated integers
-        func parseInts(_ string: String?) -> [NSNumber]? {
-            guard let string = string else { return nil }
-            return string.split(separator: ",").compactMap {
-                Int($0.trimmingCharacters(in: .whitespaces)).map { NSNumber(value: $0) }
-            }
+        try validateURL(url, format: outputFormat.format)
+        let startDate = try parseEventDate(
+            start, flag: "--start", allDay: allDay, format: outputFormat.format)
+        let endDate = try parseEventDate(
+            end, flag: "--end", allDay: allDay, format: outputFormat.format)
+        try validateEventRange(
+            start: startDate, end: endDate, allDay: allDay, format: outputFormat.format)
+        let parsedAlarms = try parseAlarms(alarms, format: outputFormat.format)
+        let recurrence: ParsedRecurrence?
+        do {
+            recurrence = try InputValidation.parseRecurrence(
+                frequency: recurrenceFrequency,
+                interval: recurrenceInterval,
+                endCount: recurrenceEndCount,
+                endDate: recurrenceEndDate,
+                noEnd: recurrenceNoEnd,
+                days: recurrenceDays,
+                months: recurrenceMonths,
+                daysOfMonth: recurrenceDaysOfMonth,
+                weeksOfYear: recurrenceWeeksOfYear,
+                daysOfYear: recurrenceDaysOfYear,
+                setPositions: recurrenceSetPositions,
+                allDay: allDay,
+                eventStart: startDate,
+                timeZone: .current)
+        } catch {
+            try invalid(error.localizedDescription, format: outputFormat.format)
         }
-
-        // Helper to parse months (names or numbers)
-        func parseMonths(_ string: String?) -> [NSNumber]? {
-            guard let string = string else { return nil }
-            let monthMap: [String: Int] = [
-                "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-                "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
-                "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "september": 9,
-                "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
-            ]
-
-            return string.split(separator: ",").compactMap { component in
-                let trimmed = component.trimmingCharacters(in: .whitespaces).lowercased()
-                if let val = Int(trimmed) { return NSNumber(value: val) }
-                if let val = monthMap[trimmed] { return NSNumber(value: val) }
-                return nil
-            }
+        let calendarID: String
+        do {
+            calendarID = try ConfigManager.resolveAliasThrowing(calendar)
+        } catch {
+            try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
         }
-
-        let alarmsList = AlarmParsing.parse(alarms)
-        let calendarID = ConfigManager.resolveAlias(calendar)
-
+        try validateIdentifier(calendarID, flag: "--calendar", format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.events, format: outputFormat.format)
-        let result = manager.addEvent(
-            calendarID: calendarID,
-            title: title,
-            startDate: startDate,
-            endDate: endDate,
-            location: location,
-            notes: notes,
-            allDay: allDay,
-            recurrenceFrequency: recurrenceFrequency,
-            recurrenceInterval: recurrenceIntervalInt,
-            recurrenceEndCount: recurrenceEndCountInt,
-            recurrenceEndDate: rEndDate,
-            recurrenceDays: recurrenceDays,
-            recurrenceMonths: parseMonths(recurrenceMonths),
-            recurrenceDaysOfMonth: parseInts(recurrenceDaysOfMonth),
-            recurrenceWeeksOfYear: parseInts(recurrenceWeeksOfYear),
-            recurrenceDaysOfYear: parseInts(recurrenceDaysOfYear),
-            recurrenceSetPositions: parseInts(recurrenceSetPositions),
-            travelTime: travelTimeSeconds,
-            alarms: alarmsList,
-            url: url,
-            availability: availability
-        )
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(
+            manager.addEvent(
+                calendarID: calendarID,
+                title: title,
+                startDate: startDate,
+                endDate: endDate,
+                location: location,
+                notes: notes,
+                allDay: allDay,
+                recurrenceFrequency: recurrence?.frequency,
+                recurrenceInterval: recurrence?.interval ?? 1,
+                recurrenceEndCount: recurrence?.endCount,
+                recurrenceEndDate: recurrence?.endDate,
+                recurrenceDays: recurrence?.days,
+                recurrenceMonths: recurrence?.months,
+                recurrenceDaysOfMonth: recurrence?.daysOfMonth,
+                recurrenceWeeksOfYear: recurrence?.weeksOfYear,
+                recurrenceDaysOfYear: recurrence?.daysOfYear,
+                recurrenceSetPositions: recurrence?.setPositions,
+                alarms: parsedAlarms,
+                url: url,
+                availability: availability,
+                geocodeLocation: geocodeLocation,
+                dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
 
 struct AddReminder: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "reminder",
-        abstract: "Create a new reminder."
-    )
-
-    @Option(name: .long, help: "The reminder list ID or alias.")
-    var list: String
-
-    @Option(name: .long, help: "The reminder title.")
-    var title: String
-
-    @Option(name: .long, help: "Optional due date in \(DateParsing.acceptedFormats).")
-    var due: String?
-
-    @Option(name: .long, help: "Priority (0=none, 1=high, 5=medium, 9=low).")
-    var priority: String?
-
-    @Option(name: .long, help: "Optional notes.")
-    var notes: String?
-
+    static let configuration = CommandConfiguration(commandName: "reminder")
+    @Option(name: .long, help: "Reminder-list ID or alias.") var list: String
+    @Option(name: .long, help: "Reminder title.") var title: String
+    @Option(name: .long, help: "Due date in \(DateParsing.acceptedFormats).") var due: String?
+    @Option(name: .long, help: "One digit from 0 through 9.") var priority: String?
+    @Option(name: .long, help: "Notes.") var notes: String?
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        // Validate arguments before triggering the TCC permission prompt.
-        var dueDate: Date?
-        if let due = due {
-            dueDate = try parseDateOption(due, flag: "--due", format: outputFormat.format)
+        guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            try invalid("--title must not be empty.", format: outputFormat.format)
         }
-
-        // Parse priority: require an integer when provided, else error
-        var priorityInt: Int = 0
-        if let priority = priority {
-            if let p = Int(priority) {
-                priorityInt = p
-            } else {
-                print(
-                    JSONOutput.error(
-                        "Invalid --priority value. Must be an integer (e.g., 0,1,5,9). Please use numeric priorities."
-                    ).format(outputFormat.format))
-                throw ExitCode.failure
-            }
+        let dueDate = try due.map {
+            try parseTimestamp($0, flag: "--due", format: outputFormat.format)
         }
-
-        let listID = ConfigManager.resolveAlias(list)
-
+        let parsedPriority = try parsePriority(
+            priority, default: 0, format: outputFormat.format) ?? 0
+        let listID: String
+        do {
+            listID = try ConfigManager.resolveAliasThrowing(list)
+        } catch {
+            try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
+        }
+        try validateIdentifier(listID, flag: "--list", format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.reminders, format: outputFormat.format)
-        let result = manager.addReminder(
-            listID: listID,
-            title: title,
-            dueDate: dueDate,
-            priority: priorityInt,
-            notes: notes
-        )
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .reminders, format: outputFormat.format)
+        try emit(
+            manager.addReminder(
+                listID: listID,
+                title: title,
+                dueDate: dueDate,
+                priority: parsedPriority,
+                notes: notes,
+                dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
 
-// MARK: - Update Command
+// MARK: - Update commands
 
 struct Update: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Update an existing event or reminder.",
-        subcommands: [UpdateEvent.self, UpdateReminder.self]
-    )
+        abstract: "Update an item.", subcommands: [UpdateEvent.self, UpdateReminder.self])
 }
 
 struct UpdateEvent: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "event",
-        abstract: "Update a calendar event."
-    )
-
-    @Argument(help: "The event ID to update.")
-    var eventID: String
-
-    @Option(name: .long, help: "New title.")
-    var title: String?
-
-    @Option(name: .long, help: "New start date in \(DateParsing.acceptedFormats).")
+    static let configuration = CommandConfiguration(commandName: "event")
+    @Argument(help: "Event identifier.") var eventID: String
+    @OptionGroup var occurrence: OccurrenceOptions
+    @Option(name: .long) var title: String?
+    @Option(name: .long, help: "New timestamp, or YYYY-MM-DD when --all-day true.")
     var start: String?
-
-    @Option(name: .long, help: "New end date in \(DateParsing.acceptedFormats).")
+    @Option(name: .long, help: "New exclusive boundary; format follows --all-day.")
     var end: String?
-
-    @Option(name: .long, help: "New location.")
-    var location: String?
-
-    @Option(name: .long, help: "New notes.")
-    var notes: String?
-
-    @Option(name: .long, help: "Mark as all-day event (true/false).")
+    @Option(name: .long) var location: String?
+    @Option(name: .long) var notes: String?
+    @Option(name: .long, help: "Date changes require start, end, and this flag together.")
     var allDay: Bool?
-
-    @Option(name: .long, help: "New URL.")
-    var url: String?
-
-    @Option(name: .long, help: "New availability (busy, free, tentative, unavailable).")
-    var availability: AvailabilitySetting?
-
-    @Option(name: .long, help: "Travel time in minutes.")
-    var travelTime: String?
-
-    @Option(name: .long, help: "Alarms relative to start (minutes). Replaces existing alarms.")
-    var alarms: String?
-
+    @Option(name: .long) var url: String?
+    @Option(name: .long) var availability: AvailabilitySetting?
+    @Option(name: .long, help: "Replacement alarm offsets in minutes.") var alarms: String?
+    @Flag(name: .long, help: "Explicitly remove every alarm from the event.")
+    var clearAlarms = false
+    @Flag(name: .long, help: "Opt in to geocoding the new --location.")
+    var geocodeLocation = false
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        // Validate arguments before triggering the TCC permission prompt.
-        var startDate: Date?
-        if let start = start {
-            startDate = try parseDateOption(start, flag: "--start", format: outputFormat.format)
+        try validateIdentifier(eventID, flag: "event ID", format: outputFormat.format)
+        if let title, title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try invalid("--title must not be empty.", format: outputFormat.format)
         }
-        var endDate: Date?
-        if let end = end {
-            endDate = try parseDateOption(end, flag: "--end", format: outputFormat.format)
+        let changesRequested = title != nil || start != nil || end != nil || location != nil
+            || notes != nil || allDay != nil || url != nil || availability != nil || alarms != nil
+            || clearAlarms || geocodeLocation
+        guard changesRequested else {
+            try invalid("No event changes were supplied.", format: outputFormat.format)
         }
-
-        let alarmsList = AlarmParsing.parse(alarms)
-
-        var travelTimeSeconds: TimeInterval?
-        if let ttString = travelTime, let ttInt = Int(ttString) {
-            travelTimeSeconds = TimeInterval(ttInt * 60)
+        let changesDateShape = start != nil || end != nil || allDay != nil
+        if changesDateShape && !(start != nil && end != nil && allDay != nil) {
+            try invalid(
+                "Date changes require --start, --end, and --all-day true/false together.",
+                format: outputFormat.format)
         }
-
+        if geocodeLocation && location?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            try invalid("--geocode-location requires a non-empty --location.", format: outputFormat.format)
+        }
+        if alarms != nil && clearAlarms {
+            try invalid(
+                "--alarms and --clear-alarms are mutually exclusive.",
+                format: outputFormat.format)
+        }
+        try validateURL(url, format: outputFormat.format)
+        let startDate = try start.map {
+            try parseEventDate(
+                $0, flag: "--start", allDay: allDay!, format: outputFormat.format)
+        }
+        let endDate = try end.map {
+            try parseEventDate($0, flag: "--end", allDay: allDay!, format: outputFormat.format)
+        }
+        if let startDate, let endDate {
+            try validateEventRange(
+                start: startDate,
+                end: endDate,
+                allDay: allDay!,
+                format: outputFormat.format)
+        }
+        let parsedAlarms = clearAlarms
+            ? [] : try parseAlarms(alarms, format: outputFormat.format)
+        let selector = try occurrence.selector(format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.events, format: outputFormat.format)
-        let result = manager.updateEvent(
-            eventID: eventID,
-            title: title,
-            startDate: startDate,
-            endDate: endDate,
-            location: location,
-            notes: notes,
-            allDay: allDay,
-            url: url,
-            availability: availability,
-            travelTime: travelTimeSeconds,
-            alarms: alarmsList
-        )
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(
+            manager.updateEvent(
+                eventID: eventID,
+                selector: selector,
+                title: title,
+                startDate: startDate,
+                endDate: endDate,
+                location: location,
+                notes: notes,
+                allDay: allDay,
+                url: url,
+                availability: availability,
+                alarms: parsedAlarms,
+                geocodeLocation: geocodeLocation,
+                dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
 
 struct UpdateReminder: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "reminder",
-        abstract: "Update an existing reminder."
-    )
-
-    @Argument(help: "The reminder ID to update.")
-    var reminderID: String
-
-    @Option(name: .long, help: "New title.")
-    var title: String?
-
-    @Option(name: .long, help: "New due date in \(DateParsing.acceptedFormats).")
-    var due: String?
-
-    @Option(name: .long, help: "New priority (0=none, 1=high, 5=medium, 9=low).")
-    var priority: String?
-
-    @Option(name: .long, help: "New notes.")
-    var notes: String?
-
-    @Option(name: .long, help: "Mark as completed (true/false).")
-    var completed: Bool?
-
+    static let configuration = CommandConfiguration(commandName: "reminder")
+    @Argument(help: "Reminder identifier.") var reminderID: String
+    @Option(name: .long) var title: String?
+    @Option(name: .long, help: "New due date in \(DateParsing.acceptedFormats).") var due: String?
+    @Option(name: .long, help: "One digit from 0 through 9.") var priority: String?
+    @Option(name: .long) var notes: String?
+    @Option(name: .long) var completed: Bool?
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        // Validate arguments before triggering the TCC permission prompt.
-        var dueDate: Date?
-        if let due = due {
-            dueDate = try parseDateOption(due, flag: "--due", format: outputFormat.format)
+        try validateIdentifier(reminderID, flag: "reminder ID", format: outputFormat.format)
+        if let title, title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try invalid("--title must not be empty.", format: outputFormat.format)
         }
-
-        var priorityInt: Int?
-        if let priority = priority {
-            guard let p = Int(priority) else {
-                print(
-                    JSONOutput.error(
-                        "Invalid --priority value. Must be an integer (0, 1, 5, or 9)."
-                    ).format(outputFormat.format))
-                throw ExitCode.failure
-            }
-            priorityInt = p
+        guard title != nil || due != nil || priority != nil || notes != nil || completed != nil else {
+            try invalid("No reminder changes were supplied.", format: outputFormat.format)
         }
-
+        let dueDate = try due.map {
+            try parseTimestamp($0, flag: "--due", format: outputFormat.format)
+        }
+        let parsedPriority = try parsePriority(priority, format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.reminders, format: outputFormat.format)
-        let result = manager.updateReminder(
-            reminderID: reminderID,
-            title: title,
-            dueDate: dueDate,
-            priority: priorityInt,
-            notes: notes,
-            completed: completed
-        )
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .reminders, format: outputFormat.format)
+        try emit(
+            manager.updateReminder(
+                reminderID: reminderID,
+                title: title,
+                dueDate: dueDate,
+                priority: parsedPriority,
+                notes: notes,
+                completed: completed,
+                dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
 
-// MARK: - Calendar Managment Commands
+// MARK: - Calendar commands
 
 struct CalendarCmd: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "calendar",
-        abstract: "Manage calendars.",
-        subcommands: [CreateCalendar.self, UpdateCalendar.self, DeleteCalendar.self]
-    )
+        abstract: "Manage event calendars.",
+        subcommands: [CreateCalendar.self, UpdateCalendar.self, DeleteCalendar.self])
 }
 
 struct CreateCalendar: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "create",
-        abstract: "Create a new calendar."
-    )
-
-    @Option(name: .long, help: "Title of the new calendar.")
-    var title: String
-
-    @Option(name: .long, help: "Color hex code (e.g. #FF0000).")
-    var color: String?
-
+    static let configuration = CommandConfiguration(commandName: "create")
+    @Option(name: .long, help: "Exact source ID from `ekctl list sources`.") var source: String
+    @Option(name: .long) var title: String
+    @Option(name: .long, help: "Exact #RRGGBB color.") var color: String?
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
+        try validateIdentifier(source, flag: "--source", format: outputFormat.format)
+        guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            try invalid("--title must not be empty.", format: outputFormat.format)
+        }
+        try validateColor(color, format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.events, format: outputFormat.format)
-        let result = manager.createCalendar(title: title, color: color)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(
+            manager.createCalendar(
+                sourceID: source, title: title, color: color, dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
 
 struct UpdateCalendar: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "update",
-        abstract: "Update a calendar."
-    )
-
-    @Argument(help: "Calendar ID to update.")
-    var calendarID: String
-
-    @Option(name: .long, help: "New title.")
-    var title: String?
-
-    @Option(name: .long, help: "New color hex code.")
-    var color: String?
-
+    static let configuration = CommandConfiguration(commandName: "update")
+    @Argument(help: "Event-calendar ID or alias.") var calendarID: String
+    @Option(name: .long) var title: String?
+    @Option(name: .long, help: "Exact #RRGGBB color.") var color: String?
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
+        guard title != nil || color != nil else {
+            try invalid("No calendar changes were supplied.", format: outputFormat.format)
+        }
+        if let title, title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try invalid("--title must not be empty.", format: outputFormat.format)
+        }
+        try validateColor(color, format: outputFormat.format)
+        let resolvedID: String
+        do {
+            resolvedID = try ConfigManager.resolveAliasThrowing(calendarID)
+        } catch {
+            try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
+        }
+        try validateIdentifier(resolvedID, flag: "calendar ID", format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        // .all: the ID may name an event calendar or a reminder list.
-        try manager.requestAccess(.all, format: outputFormat.format)
-        let resolvedID = ConfigManager.resolveAlias(calendarID)
-        let result = manager.updateCalendar(calendarID: resolvedID, title: title, color: color)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(
+            manager.updateCalendar(
+                calendarID: resolvedID,
+                title: title,
+                color: color,
+                dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
 
 struct DeleteCalendar: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "delete",
-        abstract: "Delete a calendar."
-    )
-
-    @Argument(help: "Calendar ID to delete.")
-    var calendarID: String
-
+        commandName: "delete", abstract: "Delete an event calendar.")
+    @Argument(help: "Event-calendar ID or alias.") var calendarID: String
+    @Option(name: .long, help: "Exact resolved calendar ID; required for a real deletion.")
+    var confirm: String?
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
+        let resolvedID: String
+        do {
+            resolvedID = try ConfigManager.resolveAliasThrowing(calendarID)
+        } catch {
+            try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
+        }
+        try validateIdentifier(resolvedID, flag: "calendar ID", format: outputFormat.format)
+        if !mutation.dryRun && confirm != resolvedID {
+            try invalid(
+                "Calendar deletion requires --confirm with the exact resolved ID: \(resolvedID)",
+                format: outputFormat.format)
+        }
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        // .all: the ID may name an event calendar or a reminder list.
-        try manager.requestAccess(.all, format: outputFormat.format)
-        // Resolve alias if needed
-        let resolvedID = ConfigManager.resolveAlias(calendarID)
-        let result = manager.deleteCalendar(calendarID: resolvedID)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(
+            manager.deleteCalendar(calendarID: resolvedID, dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
 
-// MARK: - Helper Methods
+// MARK: - Delete and complete commands
 
 struct Delete: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Delete an event or reminder.",
-        subcommands: [DeleteEvent.self, DeleteReminder.self]
-    )
+        abstract: "Delete an item.", subcommands: [DeleteEvent.self, DeleteReminder.self])
 }
 
 struct DeleteEvent: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "event",
-        abstract: "Delete a calendar event."
-    )
-
-    @Argument(help: "The event ID to delete.")
-    var eventID: String
-
+    static let configuration = CommandConfiguration(commandName: "event")
+    @Argument(help: "Event identifier.") var eventID: String
+    @OptionGroup var occurrence: OccurrenceOptions
+    @Flag(name: .long, help: "Required for a real deletion.") var yes = false
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
+        guard yes || mutation.dryRun else {
+            try invalid(
+                "Event deletion requires --yes (or use --dry-run).", format: outputFormat.format)
+        }
+        try validateIdentifier(eventID, flag: "event ID", format: outputFormat.format)
+        let selector = try occurrence.selector(format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.events, format: outputFormat.format)
-        let result = manager.deleteEvent(eventID: eventID)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(
+            manager.deleteEvent(
+                eventID: eventID, selector: selector, dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
 
 struct DeleteReminder: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "reminder",
-        abstract: "Delete a reminder."
-    )
-
-    @Argument(help: "The reminder ID to delete.")
-    var reminderID: String
-
+    static let configuration = CommandConfiguration(commandName: "reminder")
+    @Argument(help: "Reminder identifier.") var reminderID: String
+    @Flag(name: .long, help: "Required for a real deletion.") var yes = false
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
+        guard yes || mutation.dryRun else {
+            try invalid(
+                "Reminder deletion requires --yes (or use --dry-run).", format: outputFormat.format)
+        }
+        try validateIdentifier(reminderID, flag: "reminder ID", format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.reminders, format: outputFormat.format)
-        let result = manager.deleteReminder(reminderID: reminderID)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .reminders, format: outputFormat.format)
+        try emit(
+            manager.deleteReminder(reminderID: reminderID, dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
-
-// MARK: - Complete Command
 
 struct Complete: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Mark items as completed.",
-        subcommands: [CompleteReminder.self]
-    )
+        abstract: "Mark an item completed.", subcommands: [CompleteReminder.self])
 }
 
 struct CompleteReminder: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "reminder",
-        abstract: "Mark a reminder as completed."
-    )
-
-    @Argument(help: "The reminder ID to complete.")
-    var reminderID: String
-
+    static let configuration = CommandConfiguration(commandName: "reminder")
+    @Argument(help: "Reminder identifier.") var reminderID: String
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
+        try validateIdentifier(reminderID, flag: "reminder ID", format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.reminders, format: outputFormat.format)
-        let result = manager.completeReminder(reminderID: reminderID)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .reminders, format: outputFormat.format)
+        try emit(
+            manager.completeReminder(reminderID: reminderID, dryRun: mutation.dryRun),
+            format: outputFormat.format)
     }
 }
 
-// MARK: - Alias Commands
+// MARK: - Alias commands
 
 struct Alias: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Manage calendar and reminder list aliases.",
-        subcommands: [AliasSet.self, AliasRemove.self, AliasList.self]
-    )
+        abstract: "Manage local aliases.",
+        subcommands: [AliasSet.self, AliasRemove.self, AliasList.self])
 }
 
 struct AliasSet: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "set",
-        abstract: "Create or update an alias for a calendar or reminder list."
-    )
-
-    @Argument(help: "The alias name (e.g., 'work', 'personal', 'groceries').")
-    var name: String
-
-    @Argument(help: "The calendar or reminder list ID.")
-    var id: String
-
+    static let configuration = CommandConfiguration(commandName: "set")
+    @Argument(help: "Alias name.") var name: String
+    @Argument(help: "Calendar or reminder-list ID.") var id: String
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
         do {
-            try ConfigManager.setAlias(name: name, id: id)
-            print(
-                JSONOutput.success([
-                    "status": "success",
-                    "message": "Alias '\(name)' set successfully",
-                    "alias": [
-                        "name": name,
-                        "id": id,
+            try ConfigManager.validateAlias(name: name, id: id)
+            // A dry run must validate the same existing config state that the
+            // real read-modify-write operation depends on. This read is
+            // side-effect-free and also provides an accurate before value.
+            let aliases = try ConfigManager.getAliasesThrowing()
+            if !mutation.dryRun { try ConfigManager.setAlias(name: name, id: id) }
+            try emit(
+                .success([
+                    "dryRun": mutation.dryRun,
+                    "applied": !mutation.dryRun,
+                    "message": mutation.dryRun
+                        ? "Alias update validated; configuration was not changed."
+                        : "Alias set successfully.",
+                    "alias": ["name": name, "id": id],
+                    "changes": [
+                        "id": [
+                            "before": aliases[name].map { $0 as Any } ?? NSNull(),
+                            "after": id,
+                        ],
                     ],
-                ]).format(outputFormat.format))
+                ]),
+                format: outputFormat.format)
+        } catch let code as ExitCode {
+            throw code
         } catch {
-            print(JSONOutput.error("Failed to save alias: \(error.localizedDescription)").format(outputFormat.format))
-            throw ExitCode.failure
+            try configFailed(error, context: "Failed to set alias", format: outputFormat.format)
         }
     }
 }
 
 struct AliasRemove: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "remove",
-        abstract: "Remove an alias."
-    )
-
-    @Argument(help: "The alias name to remove.")
-    var name: String
-
+    static let configuration = CommandConfiguration(commandName: "remove")
+    @Argument(help: "Alias name.") var name: String
+    @OptionGroup var mutation: MutationOptions
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
         do {
-            let removed = try ConfigManager.removeAlias(name: name)
-            if removed {
-                print(
-                    JSONOutput.success([
-                        "status": "success",
-                        "message": "Alias '\(name)' removed successfully",
-                    ]).format(outputFormat.format))
-            } else {
-                print(JSONOutput.error("Alias '\(name)' not found").format(outputFormat.format))
-                throw ExitCode.failure
+            try ConfigManager.validateAliasName(name)
+            let aliases = try ConfigManager.getAliasesThrowing()
+            guard aliases[name] != nil else {
+                try operationFailed("Alias '\(name)' was not found.", format: outputFormat.format)
             }
-        } catch let error where !(error is ExitCode) {
-            print(
-                JSONOutput.error("Failed to remove alias: \(error.localizedDescription)").format(outputFormat.format))
-            throw ExitCode.failure
+            if !mutation.dryRun {
+                guard try ConfigManager.removeAlias(name: name) else {
+                    try operationFailed("Alias '\(name)' was not found.", format: outputFormat.format)
+                }
+            }
+            try emit(
+                .success([
+                    "dryRun": mutation.dryRun,
+                    "applied": !mutation.dryRun,
+                    "message": mutation.dryRun
+                        ? "Alias removal validated; configuration was not changed."
+                        : "Alias removed successfully.",
+                    "alias": ["name": name, "id": aliases[name]!],
+                ]),
+                format: outputFormat.format)
+        } catch let code as ExitCode {
+            throw code
+        } catch {
+            try configFailed(error, context: "Failed to remove alias", format: outputFormat.format)
         }
     }
 }
 
 struct AliasList: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "list",
-        abstract: "List all configured aliases."
-    )
-
+    static let configuration = CommandConfiguration(commandName: "list")
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        let aliases = ConfigManager.getAliases()
-        var aliasList: [[String: String]] = []
-
-        for (name, id) in aliases.sorted(by: { $0.key < $1.key }) {
-            aliasList.append(["name": name, "id": id])
+        do {
+            let aliases = try ConfigManager.getAliasesThrowing()
+            let rows = aliases.sorted(by: { $0.key < $1.key }).map {
+                ["name": $0.key, "id": $0.value]
+            }
+            try emit(
+                .success([
+                    "aliases": rows,
+                    "count": rows.count,
+                    "configPath": ConfigManager.configPath(),
+                ]),
+                format: outputFormat.format)
+        } catch let code as ExitCode {
+            throw code
+        } catch {
+            try operationFailed(
+                "Failed to read aliases: \(error.localizedDescription)", format: outputFormat.format)
         }
-
-        print(
-            JSONOutput.success([
-                "aliases": aliasList,
-                "count": aliasList.count,
-                "configPath": ConfigManager.configPath(),
-            ]).format(outputFormat.format))
     }
 }
 
-// MARK: - Quick Date-Range Commands
-//
-// Convenience subcommands that wrap `list events` with a pre-computed local
-// date range, removing the BSD-only `date -v+1d …` prelude that every script
-// otherwise needs. All three accept the same filter/format flags as
-// `list events`, so they compose cleanly with `--search`, `--availability`,
-// and `--format`.
+// MARK: - Quick date-range commands
+
+private func listQuickRange(
+    calendar: String,
+    search: String?,
+    availability: AvailabilityFilter?,
+    range: (Date, Date),
+    outputFormat: OutputFormatOptions
+) throws {
+    let calendarIDs: [String]
+    do {
+        calendarIDs = try ConfigManager.resolveCalendarIDsThrowing(calendar)
+    } catch {
+        try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
+    }
+    try validateIdentifiers(calendarIDs, flag: "--calendar", format: outputFormat.format)
+    let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
+    try requestAccess(manager, .events, format: outputFormat.format)
+    try emit(
+        manager.listEvents(
+            calendarIDs: calendarIDs,
+            from: range.0,
+            to: range.1,
+            search: search,
+            availability: availability),
+        format: outputFormat.format)
+}
 
 struct Today: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "today",
-        abstract: "List events occurring today (local time)."
-    )
-
-    @Option(
-        name: .long,
-        help: "Calendar ID or alias. Pass multiple comma-separated values to fetch events from several calendars (e.g., work,personal)."
-    )
-    var calendar: String
-
-    @Option(
-        name: .long,
-        help: "Case-insensitive substring filter applied across title, location, and notes."
-    )
-    var search: String?
-
-    @Option(
-        name: .long,
-        help: "Filter events by EventKit availability (busy, free, tentative, unavailable, notSupported)."
-    )
-    var availability: AvailabilityFilter?
-
+        commandName: "today", abstract: "List events occurring today in local time.")
+    @Option(name: .long) var calendar: String
+    @Option(name: .long) var search: String?
+    @Option(name: .long) var availability: AvailabilityFilter?
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.events, format: outputFormat.format)
-
-        let (start, end) = DateRanges.today()
-        let calendarIDs = ConfigManager.resolveCalendarIDs(calendar)
-
-        let result = manager.listEvents(
-            calendarIDs: calendarIDs,
-            from: start,
-            to: end,
+        try listQuickRange(
+            calendar: calendar,
             search: search,
-            availability: availability)
-        print(result.format(outputFormat.format))
+            availability: availability,
+            range: DateRanges.today(),
+            outputFormat: outputFormat)
     }
 }
 
 struct Tomorrow: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "tomorrow",
-        abstract: "List events occurring tomorrow (local time)."
-    )
-
-    @Option(
-        name: .long,
-        help: "Calendar ID or alias. Pass multiple comma-separated values to fetch events from several calendars (e.g., work,personal)."
-    )
-    var calendar: String
-
-    @Option(
-        name: .long,
-        help: "Case-insensitive substring filter applied across title, location, and notes."
-    )
-    var search: String?
-
-    @Option(
-        name: .long,
-        help: "Filter events by EventKit availability (busy, free, tentative, unavailable, notSupported)."
-    )
-    var availability: AvailabilityFilter?
-
+        commandName: "tomorrow", abstract: "List events occurring tomorrow in local time.")
+    @Option(name: .long) var calendar: String
+    @Option(name: .long) var search: String?
+    @Option(name: .long) var availability: AvailabilityFilter?
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.events, format: outputFormat.format)
-
-        let (start, end) = DateRanges.tomorrow()
-        let calendarIDs = ConfigManager.resolveCalendarIDs(calendar)
-
-        let result = manager.listEvents(
-            calendarIDs: calendarIDs,
-            from: start,
-            to: end,
+        try listQuickRange(
+            calendar: calendar,
             search: search,
-            availability: availability)
-        print(result.format(outputFormat.format))
+            availability: availability,
+            range: DateRanges.tomorrow(),
+            outputFormat: outputFormat)
     }
 }
 
 struct Next: ParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "next",
-        abstract: "Show upcoming events from now, sorted by start time."
-    )
-
-    @Option(
-        name: .long,
-        help: "Calendar ID or alias. Pass multiple comma-separated values to fetch events from several calendars (e.g., work,personal)."
-    )
-    var calendar: String
-
-    @Option(
-        name: .long,
-        help: "Number of upcoming events to return (default: 1)."
-    )
-    var count: Int = 1
-
-    @Option(
-        name: .long,
-        help: "Lookahead window in days. Events further out than this are ignored (default: 90)."
-    )
-    var days: Int = 90
-
-    @Option(
-        name: .long,
-        help: "Case-insensitive substring filter applied across title, location, and notes."
-    )
-    var search: String?
-
-    @Option(
-        name: .long,
-        help: "Filter events by EventKit availability (busy, free, tentative, unavailable, notSupported)."
-    )
-    var availability: AvailabilityFilter?
-
+        commandName: "next", abstract: "List the next upcoming events.")
+    @Option(name: .long) var calendar: String
+    @Option(name: .long, help: "Positive number of events.") var count = 1
+    @Option(name: .long, help: "Positive lookahead in days.") var days = 90
+    @Option(name: .long) var search: String?
+    @Option(name: .long) var availability: AvailabilityFilter?
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        // Validate arguments before triggering the TCC permission prompt.
         guard count > 0 else {
-            print(JSONOutput.error("--count must be a positive integer.").format(outputFormat.format))
-            throw ExitCode.failure
+            try invalid("--count must be positive.", format: outputFormat.format)
         }
-        guard days > 0 else {
-            print(JSONOutput.error("--days must be a positive integer.").format(outputFormat.format))
-            throw ExitCode.failure
+        guard (1...DateRanges.maximumNextWindowDays).contains(days) else {
+            try invalid(
+                "--days must be between 1 and \(DateRanges.maximumNextWindowDays).",
+                format: outputFormat.format)
         }
-
+        guard let range = DateRanges.nextWindow(days: days) else {
+            try invalid("--days could not be represented as a date range.", format: outputFormat.format)
+        }
+        let calendarIDs: [String]
+        do {
+            calendarIDs = try ConfigManager.resolveCalendarIDsThrowing(calendar)
+        } catch {
+            try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
+        }
+        try validateIdentifiers(calendarIDs, flag: "--calendar", format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
-        try manager.requestAccess(.events, format: outputFormat.format)
-
-        let (start, end) = DateRanges.nextWindow(days: days)
-        let calendarIDs = ConfigManager.resolveCalendarIDs(calendar)
-
-        let result = manager.listEvents(
-            calendarIDs: calendarIDs,
-            from: start,
-            to: end,
-            search: search,
-            availability: availability,
-            sortedByStartAscending: true,
-            limit: count)
-        print(result.format(outputFormat.format))
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(
+            manager.listEvents(
+                calendarIDs: calendarIDs,
+                from: range.0,
+                to: range.1,
+                search: search,
+                availability: availability,
+                sortedByStartAscending: true,
+                limit: count),
+            format: outputFormat.format)
     }
 }

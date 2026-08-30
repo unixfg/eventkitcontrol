@@ -49,18 +49,21 @@ brew install ekctl
 ```bash
 git clone https://github.com/schappim/ekctl.git
 cd ekctl
-swift build -c release
-
-# Optional: Sign with entitlements
-codesign --force --sign - --entitlements ekctl.entitlements .build/release/ekctl
-
-# Install
-sudo cp .build/release/ekctl /usr/local/bin/
+./build.sh
 ```
+
+`build.sh` uses the checked-in dependency lock, embeds and validates the privacy
+usage descriptions, applies Hardened Runtime plus the EventKit entitlements,
+and prints the unique validated binary and archive paths under a fresh
+`.build/ekctl-build.*/local-package/` directory. It does not install anything
+outside the repository.
 
 ### Permissions
 
-On first run, macOS will prompt for access to the data the command touches — Calendars, Reminders, or both (e.g., `ekctl list calendars` lists both stores). Commands only request what they need, so a reminders-only workflow never triggers the Calendar prompt. Manage permissions in **System Settings → Privacy & Security → Calendars / Reminders**.
+On first run, macOS will prompt for access to the data the command touches.
+Event-calendar and reminder-list commands are separate, so a reminders-only
+workflow never triggers the Calendar prompt (and vice versa). Manage permissions
+in **System Settings → Privacy & Security → Calendars / Reminders**.
 
 ## Calendars
 
@@ -81,7 +84,7 @@ ekctl list calendars
       "id": "CA513B39-1659-4359-8FE9-0C2A3DCEF153",
       "title": "Work",
       "type": "event",
-      "source": "iCloud",
+      "source": { "id": "SOURCE_ID", "title": "iCloud", "type": "calDAV" },
       "color": "#0088FF",
       "allowsModifications": true
     }
@@ -92,10 +95,12 @@ ekctl list calendars
 
 ### Create Calendar
 
-**Command:**
+Choose an account source explicitly; ekctl never guesses an iCloud or local
+account:
 
 ```bash
-ekctl calendar create --title "Project X" --color "#FF5500"
+ekctl list sources
+ekctl calendar create --source SOURCE_ID --title "Project X" --color "#FF5500"
 ```
 
 ### Update Calendar
@@ -111,8 +116,13 @@ ekctl calendar update CALENDAR_ID --title "New Name" --color "#00FF00"
 **Command:**
 
 ```bash
-ekctl calendar delete CALENDAR_ID
+ekctl calendar delete CALENDAR_ID --dry-run
+ekctl calendar delete CALENDAR_ID --confirm CALENDAR_ID
 ```
+
+Calendar update and deletion operate on event-only calendars. Reminder lists
+are listed separately with `ekctl list reminder-lists` and are not deletable by
+this CLI.
 
 ### Aliases
 
@@ -124,6 +134,9 @@ Use friendly names instead of UUIDs. Aliases work anywhere a calendar ID is acce
 ekctl alias set work "CA513B39-1659-4359-8FE9-0C2A3DCEF153"
 ekctl alias set personal "4E367C6F-354B-4811-935E-7F25A1BB7D39"
 ```
+
+Use `--dry-run` to securely load the current config and preview an alias's
+before/after value without touching the config file.
 
 **List aliases:**
 
@@ -160,7 +173,9 @@ ekctl list events --calendar "CA513B39-1659-4359-8FE9-0C2A3DCEF153" --from "2026
 ekctl list events --calendar work --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
 ```
 
-Aliases are stored in `~/.ekctl/config.json`.
+Aliases are stored in `~/.ekctl/config.json`. The directory, lock, and config
+must be owned by the current user, use private `0700`/`0600` modes, and have no
+extended ACLs; unsafe entries are rejected rather than silently trusted.
 
 ## Events
 
@@ -259,6 +274,16 @@ ekctl next --calendar work --search standup --count 3 --format text
 ekctl show event EVENT_ID
 ```
 
+For a recurring event, copy both values from its JSON `selector` object. An ID
+alone is deliberately rejected because EventKit otherwise resolves an arbitrary
+occurrence:
+
+```bash
+ekctl show event EVENT_ID \
+  --occurrence "2026-02-12T18:00:00Z" \
+  --expected-start "2026-02-12T18:00:00Z"
+```
+
 ### Add Event
 
 Basic event:
@@ -293,7 +318,11 @@ ekctl add event \
   --recurrence-end-count 20
 ```
 
-With travel time:
+Every recurrence must choose exactly one end mode:
+`--recurrence-end-count`, `--recurrence-end-date`, or `--recurrence-no-end`.
+
+Geocoding is off by default. Opt in only when you want location text sent to
+Apple's geocoder:
 
 ```bash
 ekctl add event \
@@ -302,7 +331,7 @@ ekctl add event \
   --start "2026-02-20T14:00:00Z" \
   --end "2026-02-20T16:00:00Z" \
   --location "1 Infinite Loop, Cupertino, CA" \
-  --travel-time 30
+  --geocode-location
 ```
 
 **Output:**
@@ -335,6 +364,20 @@ All flags are optional — only the fields you pass will be changed:
 ekctl update event EVENT_ID --title "New title"
 ```
 
+Date changes are the exception: supply `--start`, `--end`, and
+`--all-day true|false` together so the CLI can validate the complete range.
+Use `--clear-alarms` for an intentional removal; an empty or malformed
+`--alarms` value is rejected without changing existing alarms.
+Both `--alarms` and `--clear-alarms` replace every existing EventKit alarm
+object. That includes absolute alarms and any custom action, sound/email/
+procedure, proximity, or structured-location metadata. A dry run reports the
+complete before/after alarm set and this replacement scope before anything is
+saved.
+
+Alarm CLI input is expressed in minutes. Event output names EventKit's raw
+values explicitly as `relativeAlarmOffsetsSeconds` and `offsetSeconds`, so the
+units cannot be mistaken for reusable `--alarms` input.
+
 With multiple fields:
 
 ```bash
@@ -342,10 +385,10 @@ ekctl update event EVENT_ID \
   --title "Updated title" \
   --start "2026-02-15T14:00:00Z" \
   --end "2026-02-15T15:30:00Z" \
+  --all-day false \
   --location "Building 2, Room 301" \
   --notes "Updated notes" \
   --alarms "10,30" \
-  --travel-time 20 \
   --availability busy \
   --url "https://example.com/meeting"
 ```
@@ -379,7 +422,8 @@ ekctl update event EVENT_ID \
 **Command:**
 
 ```bash
-ekctl delete event EVENT_ID
+ekctl delete event EVENT_ID --dry-run
+ekctl delete event EVENT_ID --yes
 ```
 
 **Output:**
@@ -567,12 +611,15 @@ ekctl complete reminder REMINDER_ID
 **Command:**
 
 ```bash
-ekctl delete reminder REMINDER_ID
+ekctl delete reminder REMINDER_ID --dry-run
+ekctl delete reminder REMINDER_ID --yes
 ```
 
 ## Date Format
 
-All date **inputs** (`--from`, `--to`, `--start`, `--end`, `--due`, `--recurrence-end-date`) accept **ISO 8601** with any of these timezone suffixes, with or without fractional seconds:
+Timed date inputs accept strict **ISO 8601** timestamps in these forms. The
+entire value is consumed; invalid calendar days, trailing text, and impossible
+offsets are rejected:
 
 | Format | Example | Description |
 | -------- | --------- | ------------- |
@@ -592,6 +639,30 @@ Timestamps in **output** are rendered in your local timezone and are always vali
 ekctl next --calendar work --count 5 --time-format compact |
   jq -r '.events[] | "\(.startDate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%I:%M%p")) \(.title)"'
 ```
+
+All-day event boundaries use `YYYY-MM-DD` instead. `--end` is the exclusive end
+day, matching EventKit. A one-day event on June 3 uses
+`--start 2026-06-03 --end 2026-06-04 --all-day`. All-day values are also emitted
+date-only.
+
+## Mutation safety and scripting
+
+Every command that changes EventKit or alias configuration accepts `--dry-run`.
+Dry runs validate and preview but do not save, delete, geocode, or rewrite the
+alias file. Event and reminder deletion additionally require `--yes`; calendar
+deletion requires `--confirm` with the exact resolved calendar ID.
+
+Recurring event show/update/delete commands require the `--occurrence` and
+`--expected-start` pair shown in list/show output. Supplying the pair for a
+non-recurring event is also rejected, preventing stale selectors from targeting
+the wrong item. The original occurrence is always emitted as a timestamp—even
+when a detached occurrence is currently all-day—so its exact recurring slot is
+not lost.
+
+Errors are written to stderr as the selected structured format. Exit statuses
+are stable: `0` success, `64` invalid input, `1` operation failure, and `2`
+permission denial. CSV output neutralises spreadsheet-formula prefixes, while
+text output renders terminal control characters visibly.
 
 ## Scripting Examples
 
@@ -617,6 +688,10 @@ ekctl tomorrow --calendar work --availability busy --format csv
 # Next 3 events that mention "standup"
 ekctl next --calendar work --count 3 --search standup
 ```
+
+`next --days` accepts 1 through 1461 days, keeping EventKit queries and date
+arithmetic within a bounded four-year window.
+Explicit `list events --from/--to` ranges use the same 1461-day maximum.
 
 ### Create event from variables
 
@@ -663,12 +738,15 @@ ekctl list events --calendar work --from "$TODAY" --to "$TOMORROW" --format text
 
 ## Error Handling
 
-All errors return JSON with `status: "error"`:
+Errors are written to stderr in the selected `--format` (JSON by default).
+JSON errors include a stable code and the corresponding process exit status:
 
 ```json
 {
   "status": "error",
-  "error": "Calendar not found with ID: invalid-id"
+  "error": "Calendar not found with ID: invalid-id",
+  "code": "operation_failed",
+  "exitCode": 1
 }
 ```
 

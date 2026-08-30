@@ -1,25 +1,71 @@
 import Foundation
 
-/// Parses the `--alarms` flag: comma-separated minute offsets relative to the
-/// event start, returned as EventKit-ready second offsets for
-/// `EKAlarm(relativeOffset:)`.
-///
-/// Sign convention (matches the CLI help text):
-///   - bare positive values mean minutes *before* the start → negative seconds
-///   - a leading `+` means minutes *after* the start → positive seconds
-///   - explicit negative values are minutes before, passed through as-is
-///
-/// Unparseable components are dropped rather than failing the whole flag.
-public enum AlarmParsing {
-    public static func parse(_ string: String?) -> [Double]? {
-        guard let string = string else { return nil }
-        return string.split(separator: ",").compactMap { component in
-            let s = component.trimmingCharacters(in: .whitespaces)
-            if s.hasPrefix("+") {
-                return Double(s.dropFirst()).map { $0 * 60 }
-            }
-            guard let val = Double(s) else { return nil }
-            return val < 0 ? val * 60 : -val * 60
+public enum AlarmParsingError: LocalizedError, Equatable {
+    case empty
+    case invalid(String)
+    case outOfRange(String)
+    case duplicate
+    case tooMany
+
+    public var errorDescription: String? {
+        switch self {
+        case .empty: return "Alarm list must not be empty."
+        case .invalid: return "Alarm offsets must be finite decimal minute values."
+        case .outOfRange: return "Alarm offsets must be within one year of the event."
+        case .duplicate: return "Alarm offsets must not contain duplicates."
+        case .tooMany: return "At most 64 alarms may be supplied."
         }
+    }
+}
+
+/// Parses `--alarms` atomically. A malformed component rejects the complete
+/// value, so an update can never partially replace or accidentally clear the
+/// existing alarms.
+public enum AlarmParsing {
+    public static let maximumMinutes = 525_600.0
+    public static let maximumCount = 64
+
+    private static let decimalRegex = try! NSRegularExpression(
+        pattern: #"^[+-]?[0-9]+(?:\.[0-9]+)?$"#
+    )
+
+    /// Compatibility convenience. CLI code should use `parseRequired` for a
+    /// useful validation error when a non-nil option is malformed.
+    public static func parse(_ string: String?) -> [Double]? {
+        guard let string else { return nil }
+        return try? parseRequired(string)
+    }
+
+    public static func parseRequired(_ string: String) throws -> [Double] {
+        guard !string.isEmpty else { throw AlarmParsingError.empty }
+        let rawParts = string.split(separator: ",", omittingEmptySubsequences: false)
+        guard !rawParts.isEmpty else { throw AlarmParsingError.empty }
+        guard rawParts.count <= maximumCount else { throw AlarmParsingError.tooMany }
+
+        var results: [Double] = []
+        var seen: Set<Double> = []
+        for rawPart in rawParts {
+            let part = rawPart.trimmingCharacters(in: .whitespaces)
+            guard !part.isEmpty else { throw AlarmParsingError.empty }
+            let range = NSRange(part.startIndex..<part.endIndex, in: part)
+            guard decimalRegex.firstMatch(in: part, range: range)?.range == range,
+                  let minutes = Double(part), minutes.isFinite
+            else { throw AlarmParsingError.invalid(part) }
+            guard abs(minutes) <= maximumMinutes else {
+                throw AlarmParsingError.outOfRange(part)
+            }
+
+            let seconds: Double
+            if part.hasPrefix("+") {
+                seconds = minutes * 60
+            } else {
+                seconds = minutes < 0 ? minutes * 60 : -minutes * 60
+            }
+            let normalized = seconds == 0 ? 0.0 : seconds
+            guard normalized.isFinite else { throw AlarmParsingError.invalid(part) }
+            guard seen.insert(normalized).inserted else { throw AlarmParsingError.duplicate }
+            results.append(normalized)
+        }
+        return results
     }
 }
