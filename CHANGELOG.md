@@ -4,7 +4,7 @@ This file explains what changed, what users will notice, and why some behavior
 deliberately differs from the project this one began from. A version marked
 `Unreleased` has not yet been published.
 
-## 1.0.0 - Unreleased
+## 1.0.0 - 2026-08-31
 
 This is the first independent eventkitcontrol release. It began from
 [the original project's exact source commit][fork-point], but it now has its
