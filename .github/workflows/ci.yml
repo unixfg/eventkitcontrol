@@ -35,10 +35,12 @@ jobs:
       - name: Run ShellCheck
         run: shellcheck Scripts/*.sh
 
-      - name: Test release-note preparation
+      - name: Test Python release helpers
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 -m unittest discover -s Tests/ReleaseNotes -p '*_tests.py'
+        run: |
+          python3 -m unittest discover -s Tests/ReleaseNotes -p '*_tests.py'
+          python3 -m unittest discover -s Tests/Workflow -p '*_tests.py'
 
       - name: Reject retired upstream identity
         run: |
@@ -81,6 +83,54 @@ jobs:
           ./Scripts/validate-lockfile.sh
           swift package dump-package >/dev/null
           plutil -lint Info.plist eventkitcontrol.entitlements
+
+      - name: Test temporary keychain search-list lifecycle
+        run: |
+          set -Eeuo pipefail
+          TEST_KEYCHAIN="$RUNNER_TEMP/eventkitcontrol-ci.keychain-db"
+          SEARCH_LIST_BACKUP="$RUNNER_TEMP/eventkitcontrol-ci-keychains.json"
+
+          cleanup() {
+            ORIGINAL_RC=$?
+            set +e
+            CLEANUP_RC=0
+            if [[ -f "$SEARCH_LIST_BACKUP" && ! -L "$SEARCH_LIST_BACKUP" ]]; then
+              python3 Scripts/manage_keychain_search_list.py restore \
+                --backup "$SEARCH_LIST_BACKUP" \
+                --keychain "$TEST_KEYCHAIN" \
+                || CLEANUP_RC=1
+            fi
+            if [[ -e "$TEST_KEYCHAIN" || -L "$TEST_KEYCHAIN" ]]; then
+              security delete-keychain "$TEST_KEYCHAIN" >/dev/null 2>&1 \
+                || CLEANUP_RC=1
+            fi
+            rm -f "$SEARCH_LIST_BACKUP" || CLEANUP_RC=1
+            if [[ "$ORIGINAL_RC" -ne 0 ]]; then
+              exit "$ORIGINAL_RC"
+            fi
+            exit "$CLEANUP_RC"
+          }
+          trap cleanup EXIT
+
+          for test_path in "$TEST_KEYCHAIN" "$SEARCH_LIST_BACKUP"; do
+            [[ ! -e "$test_path" && ! -L "$test_path" ]] \
+              || { echo "error: test path already exists: $test_path" >&2; exit 1; }
+          done
+
+          python3 Scripts/manage_keychain_search_list.py snapshot \
+            --output "$SEARCH_LIST_BACKUP" \
+            --keychain "$TEST_KEYCHAIN"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$TEST_KEYCHAIN"
+          python3 Scripts/manage_keychain_search_list.py prepend \
+            --backup "$SEARCH_LIST_BACKUP" \
+            --keychain "$TEST_KEYCHAIN"
+          python3 Scripts/manage_keychain_search_list.py restore \
+            --backup "$SEARCH_LIST_BACKUP" \
+            --keychain "$TEST_KEYCHAIN"
+          security delete-keychain "$TEST_KEYCHAIN"
+          rm -f "$SEARCH_LIST_BACKUP"
+          trap - EXIT
 
       - name: Build executable from locked dependencies
         run: |

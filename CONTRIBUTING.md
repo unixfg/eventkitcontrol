@@ -73,11 +73,15 @@ bash -n Scripts/*.sh
 shellcheck Scripts/*.sh
 PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s Tests/ReleaseNotes -p '*_tests.py'
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s Tests/Workflow -p '*_tests.py'
 ```
 
 If `actionlint` is installed, run it as an additional check for GitHub Actions
-workflow mistakes. The release-note unit tests above run in ordinary CI; signed
-release operations remain macOS release-only.
+workflow mistakes. The Python unit tests above run in ordinary CI; signed
+release operations remain macOS release-only. Hosted macOS CI also exercises
+the real temporary-keychain search-list lifecycle without loading a signing
+certificate.
 
 Developer ID signing, notarization, stapling, and publication are release-only
 checks documented in the [maintainer release procedure](docs/releasing.md).

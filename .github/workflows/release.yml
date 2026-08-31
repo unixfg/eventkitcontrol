@@ -125,6 +125,7 @@ jobs:
           SIGNING_KEYCHAIN: ${{ runner.temp }}/eventkitcontrol-signing.keychain-db
           APPLICATION_P12_PATH: ${{ runner.temp }}/eventkitcontrol-application.p12
           INSTALLER_P12_PATH: ${{ runner.temp }}/eventkitcontrol-installer.p12
+          KEYCHAIN_SEARCH_LIST_BACKUP: ${{ runner.temp }}/eventkitcontrol-user-keychains.json
         run: |
           set -Eeuo pipefail
           umask 077
@@ -146,7 +147,8 @@ jobs:
           for secret_path in \
             "$SIGNING_KEYCHAIN" \
             "$APPLICATION_P12_PATH" \
-            "$INSTALLER_P12_PATH"; do
+            "$INSTALLER_P12_PATH" \
+            "$KEYCHAIN_SEARCH_LIST_BACKUP"; do
             [[ ! -e "$secret_path" && ! -L "$secret_path" ]] \
               || { echo "error: refusing to replace credential path: $secret_path" >&2; exit 1; }
           done
@@ -156,6 +158,10 @@ jobs:
           chmod 0600 "$APPLICATION_P12_PATH" "$INSTALLER_P12_PATH"
           test -s "$APPLICATION_P12_PATH"
           test -s "$INSTALLER_P12_PATH"
+
+          python3 Scripts/manage_keychain_search_list.py snapshot \
+            --output "$KEYCHAIN_SEARCH_LIST_BACKUP" \
+            --keychain "$SIGNING_KEYCHAIN"
 
           KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
@@ -265,6 +271,62 @@ jobs:
           [[ "$APPLICATION_IDENTITY" =~ ^[0-9A-Fa-f]{40}$ ]]
           [[ "$INSTALLER_IDENTITY" == "Developer ID Installer: "*"(${APPLE_TEAM_ID})" ]]
 
+          python3 Scripts/manage_keychain_search_list.py prepend \
+            --backup "$KEYCHAIN_SEARCH_LIST_BACKUP" \
+            --keychain "$SIGNING_KEYCHAIN"
+
+          security find-identity -v -p codesigning \
+            >"$RUNNER_TEMP/search-list-application-identities.txt"
+          security find-identity -v \
+            >"$RUNNER_TEMP/search-list-all-identities.txt"
+          python3 - \
+            "$RUNNER_TEMP/search-list-application-identities.txt" \
+            "$RUNNER_TEMP/search-list-all-identities.txt" \
+            "$APPLICATION_IDENTITY" \
+            "$INSTALLER_IDENTITY" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          application_input, all_input, application_identity, installer_identity = sys.argv[1:]
+          identity_pattern = re.compile(
+              r'^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"([^"]+)"\s*$'
+          )
+
+          def identities(path):
+              result = []
+              for line in pathlib.Path(path).read_text().splitlines():
+                  match = identity_pattern.match(line)
+                  if match:
+                      result.append((match.group(1), match.group(2)))
+              return result
+
+          application_matches = [
+              fingerprint
+              for fingerprint, _ in identities(application_input)
+              if fingerprint.casefold() == application_identity.casefold()
+          ]
+          installer_matches = [
+              name
+              for _, name in identities(all_input)
+              if name == installer_identity
+          ]
+          if len(application_matches) != 1:
+              print(
+                  "error: Developer ID Application identity is not uniquely visible "
+                  "through the user keychain search list",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          if len(installer_matches) != 1:
+              print(
+                  "error: Developer ID Installer identity is not uniquely visible "
+                  "through the user keychain search list",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          PY
+
           echo "application_identity=$APPLICATION_IDENTITY" >>"$GITHUB_OUTPUT"
           echo "installer_identity=$INSTALLER_IDENTITY" >>"$GITHUB_OUTPUT"
 
@@ -307,16 +369,52 @@ jobs:
           SIGNING_KEYCHAIN: ${{ runner.temp }}/eventkitcontrol-signing.keychain-db
           APPLICATION_P12_PATH: ${{ runner.temp }}/eventkitcontrol-application.p12
           INSTALLER_P12_PATH: ${{ runner.temp }}/eventkitcontrol-installer.p12
+          KEYCHAIN_SEARCH_LIST_BACKUP: ${{ runner.temp }}/eventkitcontrol-user-keychains.json
         run: |
           set +e
-          security delete-keychain "$SIGNING_KEYCHAIN" >/dev/null 2>&1
+          CLEANUP_RC=0
+
+          restore_user_keychains() {
+            if [[ -f "$KEYCHAIN_SEARCH_LIST_BACKUP" \
+              && ! -L "$KEYCHAIN_SEARCH_LIST_BACKUP" ]]; then
+              python3 Scripts/manage_keychain_search_list.py restore \
+                --backup "$KEYCHAIN_SEARCH_LIST_BACKUP" \
+                --keychain "$SIGNING_KEYCHAIN"
+              return
+            fi
+            if [[ -e "$KEYCHAIN_SEARCH_LIST_BACKUP" \
+              || -L "$KEYCHAIN_SEARCH_LIST_BACKUP" ]]; then
+              echo "error: invalid keychain search-list backup path" >&2
+              return 1
+            fi
+            if [[ -e "$SIGNING_KEYCHAIN" || -L "$SIGNING_KEYCHAIN" ]]; then
+              echo "error: signing keychain exists but search-list backup is missing" >&2
+              return 1
+            fi
+            return 0
+          }
+
+          restore_user_keychains || CLEANUP_RC=1
+          if [[ -e "$SIGNING_KEYCHAIN" || -L "$SIGNING_KEYCHAIN" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" >/dev/null 2>&1 || {
+              echo "error: could not delete signing keychain" >&2
+              CLEANUP_RC=1
+            }
+          fi
           rm -f \
             "$APPLICATION_P12_PATH" \
             "$INSTALLER_P12_PATH" \
             "$RUNNER_TEMP/application-identity.txt" \
             "$RUNNER_TEMP/installer-identity.txt" \
             "$RUNNER_TEMP/application-identities.txt" \
-            "$RUNNER_TEMP/all-identities.txt"
+            "$RUNNER_TEMP/all-identities.txt" \
+            "$RUNNER_TEMP/search-list-application-identities.txt" \
+            "$RUNNER_TEMP/search-list-all-identities.txt" \
+            || CLEANUP_RC=1
+          if [[ "$CLEANUP_RC" -eq 0 ]]; then
+            rm -f "$KEYCHAIN_SEARCH_LIST_BACKUP" || CLEANUP_RC=1
+          fi
+          exit "$CLEANUP_RC"
 
       - name: Notarize package and inspect the notary log
         env:
@@ -538,9 +636,38 @@ jobs:
           APPLICATION_P12_PATH: ${{ runner.temp }}/eventkitcontrol-application.p12
           INSTALLER_P12_PATH: ${{ runner.temp }}/eventkitcontrol-installer.p12
           NOTARY_KEY_PATH: ${{ runner.temp }}/eventkitcontrol-notary-key.p8
+          KEYCHAIN_SEARCH_LIST_BACKUP: ${{ runner.temp }}/eventkitcontrol-user-keychains.json
         run: |
           set +e
-          security delete-keychain "$SIGNING_KEYCHAIN" >/dev/null 2>&1
+          CLEANUP_RC=0
+
+          restore_user_keychains() {
+            if [[ -f "$KEYCHAIN_SEARCH_LIST_BACKUP" \
+              && ! -L "$KEYCHAIN_SEARCH_LIST_BACKUP" ]]; then
+              python3 Scripts/manage_keychain_search_list.py restore \
+                --backup "$KEYCHAIN_SEARCH_LIST_BACKUP" \
+                --keychain "$SIGNING_KEYCHAIN"
+              return
+            fi
+            if [[ -e "$KEYCHAIN_SEARCH_LIST_BACKUP" \
+              || -L "$KEYCHAIN_SEARCH_LIST_BACKUP" ]]; then
+              echo "error: invalid keychain search-list backup path" >&2
+              return 1
+            fi
+            if [[ -e "$SIGNING_KEYCHAIN" || -L "$SIGNING_KEYCHAIN" ]]; then
+              echo "error: signing keychain exists but search-list backup is missing" >&2
+              return 1
+            fi
+            return 0
+          }
+
+          restore_user_keychains || CLEANUP_RC=1
+          if [[ -e "$SIGNING_KEYCHAIN" || -L "$SIGNING_KEYCHAIN" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" >/dev/null 2>&1 || {
+              echo "error: could not delete signing keychain" >&2
+              CLEANUP_RC=1
+            }
+          fi
           rm -f \
             "$APPLICATION_P12_PATH" \
             "$INSTALLER_P12_PATH" \
@@ -548,4 +675,9 @@ jobs:
             "$RUNNER_TEMP/application-identity.txt" \
             "$RUNNER_TEMP/installer-identity.txt" \
             "$RUNNER_TEMP/application-identities.txt" \
-            "$RUNNER_TEMP/all-identities.txt"
+            "$RUNNER_TEMP/all-identities.txt" \
+            "$RUNNER_TEMP/search-list-application-identities.txt" \
+            "$RUNNER_TEMP/search-list-all-identities.txt" \
+            || CLEANUP_RC=1
+          rm -f "$KEYCHAIN_SEARCH_LIST_BACKUP" || CLEANUP_RC=1
+          exit "$CLEANUP_RC"
