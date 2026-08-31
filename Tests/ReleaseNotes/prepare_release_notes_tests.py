@@ -69,9 +69,9 @@ Second.
         self.assertIn("eventkitcontrol-v1.0.0-macos-arm64.pkg.sha256", notes)
         self.assertIn("double-click the `.pkg`", notes)
 
-    def test_first_release_entry_keeps_safety_rationale_in_release_notes(self):
+    def test_initial_release_scope_keeps_safety_rationale_in_release_notes(self):
         changelog = (PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        entry = extract_release_entry(changelog, "1.0.1")
+        entry = extract_release_entry(changelog, "1.0.2")
         self.assertIn("round-trip paradox", entry)
         self.assertIn("`--travel-time`", entry)
         self.assertIn("the original project", entry)

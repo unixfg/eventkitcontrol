@@ -41,13 +41,13 @@ reasoning behind intentional compatibility decisions.
 
 ### Signed package
 
-Tagged releases provide a signed, Apple-notarized `.pkg` for Apple Silicon
+Published releases provide a signed, Apple-notarized `.pkg` for Apple Silicon
 Macs. macOS can verify it even when offline. The installer stops before making
 changes on Intel Macs or macOS older than 14. Replace the tag below with the
 release you want:
 
 ```bash
-TAG=v1.0.1
+TAG=v1.0.2
 PACKAGE="eventkitcontrol-${TAG}-macos-arm64.pkg"
 curl -fLO "https://github.com/unixfg/eventkitcontrol/releases/download/${TAG}/${PACKAGE}"
 curl -fLO "https://github.com/unixfg/eventkitcontrol/releases/download/${TAG}/${PACKAGE}.sha256"
