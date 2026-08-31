@@ -71,6 +71,29 @@ jobs:
           xcodebuild -version
           swift --version
 
+      - name: Prepare release notes from changelog
+        id: release_notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          PACKAGE_NAME="eventkitcontrol-${RELEASE_TAG}-macos-arm64.pkg"
+          CHECKSUM_NAME="${PACKAGE_NAME}.sha256"
+          NOTES_PATH="$RUNNER_TEMP/release-notes.md"
+
+          python3 Scripts/prepare_release_notes.py \
+            --changelog CHANGELOG.md \
+            --version "$VERSION" \
+            --output "$NOTES_PATH" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --package "$PACKAGE_NAME" \
+            --checksum "$CHECKSUM_NAME"
+
+          test -s "$NOTES_PATH"
+          echo "path=$NOTES_PATH" >>"$GITHUB_OUTPUT"
+
       - name: Refuse to replace an existing release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -474,22 +497,7 @@ jobs:
           PACKAGE_NAME: ${{ steps.package.outputs.name }}
           CHECKSUM_NAME: ${{ steps.checksum.outputs.name }}
           RELEASE_TAG: ${{ github.ref_name }}
-          RELEASE_NOTES: |
-            ## Install
-
-            Download both files, verify the checksum, and run the signed installer:
-
-            ```bash
-            curl -fLO "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.package.outputs.name }}"
-            curl -fLO "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.checksum.outputs.name }}"
-            shasum -a 256 -c "${{ steps.checksum.outputs.name }}"
-            sudo installer -pkg "${{ steps.package.outputs.name }}" -target /
-            eventkitcontrol --version
-            ```
-
-            The package is Apple Silicon-only, Developer ID signed, notarized,
-            stapled for offline Gatekeeper validation, and installs
-            `eventkitcontrol` at `/usr/local/bin/eventkitcontrol`.
+          RELEASE_NOTES_PATH: ${{ steps.release_notes.outputs.path }}
         run: |
           set -Eeuo pipefail
           gh release create "$RELEASE_TAG" \
@@ -499,7 +507,7 @@ jobs:
             --verify-tag \
             --title "eventkitcontrol $RELEASE_TAG" \
             --generate-notes \
-            --notes "$RELEASE_NOTES"
+            --notes-file "$RELEASE_NOTES_PATH"
 
       - name: Final release credential cleanup fallback
         if: always()
