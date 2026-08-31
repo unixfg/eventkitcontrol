@@ -1,6 +1,6 @@
 # Releasing eventkitcontrol
 
-Pushing a version tag such as `v1.0.0` starts
+Pushing a version tag such as `v1.0.1` starts
 `.github/workflows/release.yml`; maintainers do not build or upload release
 files from their own Macs. The workflow accepts only a three-part version tag
 whose commit is on `main` and whose version matches the application metadata.
@@ -160,8 +160,8 @@ automatic release; there is no later approval prompt.
    preferably as a signed annotated tag:
 
    ```bash
-   git tag -s v1.0.0 -m "eventkitcontrol v1.0.0"
-   git push origin v1.0.0
+   git tag -s v1.0.1 -m "eventkitcontrol v1.0.1"
+   git push origin v1.0.1
    ```
 
 The tag starts the workflow automatically. Do not create the GitHub release by
@@ -196,12 +196,12 @@ of these gates pass:
 ## Verify a downloaded release
 
 ```bash
-shasum -a 256 -c eventkitcontrol-v1.0.0-macos-arm64.pkg.sha256
-pkgutil --check-signature eventkitcontrol-v1.0.0-macos-arm64.pkg
-spctl --assess --type install --verbose=4 eventkitcontrol-v1.0.0-macos-arm64.pkg
-gh attestation verify eventkitcontrol-v1.0.0-macos-arm64.pkg \
+shasum -a 256 -c eventkitcontrol-v1.0.1-macos-arm64.pkg.sha256
+pkgutil --check-signature eventkitcontrol-v1.0.1-macos-arm64.pkg
+spctl --assess --type install --verbose=4 eventkitcontrol-v1.0.1-macos-arm64.pkg
+gh attestation verify eventkitcontrol-v1.0.1-macos-arm64.pkg \
   --repo unixfg/eventkitcontrol
-gh attestation verify eventkitcontrol-v1.0.0-macos-arm64.pkg.sha256 \
+gh attestation verify eventkitcontrol-v1.0.1-macos-arm64.pkg.sha256 \
   --repo unixfg/eventkitcontrol
 ```
 

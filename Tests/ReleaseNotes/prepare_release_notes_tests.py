@@ -71,11 +71,7 @@ Second.
 
     def test_first_release_entry_keeps_safety_rationale_in_release_notes(self):
         changelog = (PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        changelog = changelog.replace(
-            "## 1.0.0 - Unreleased",
-            "## 1.0.0 - 2026-08-31",
-        )
-        entry = extract_release_entry(changelog, "1.0.0")
+        entry = extract_release_entry(changelog, "1.0.1")
         self.assertIn("round-trip paradox", entry)
         self.assertIn("`--travel-time`", entry)
         self.assertIn("the original project", entry)

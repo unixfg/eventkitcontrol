@@ -47,7 +47,7 @@ changes on Intel Macs or macOS older than 14. Replace the tag below with the
 release you want:
 
 ```bash
-TAG=v1.0.0
+TAG=v1.0.1
 PACKAGE="eventkitcontrol-${TAG}-macos-arm64.pkg"
 curl -fLO "https://github.com/unixfg/eventkitcontrol/releases/download/${TAG}/${PACKAGE}"
 curl -fLO "https://github.com/unixfg/eventkitcontrol/releases/download/${TAG}/${PACKAGE}.sha256"
