@@ -2,22 +2,32 @@
 
 [![CI](https://github.com/unixfg/eventkitcontrol/actions/workflows/ci.yml/badge.svg)](https://github.com/unixfg/eventkitcontrol/actions/workflows/ci.yml)
 
-A safety-first native macOS command-line tool for managing Calendar events and
-Reminders through EventKit. Mutations are explicit and previewable, destructive
-operations fail closed, and output is JSON by default with CSV and plain-text
-formats available for scripting.
+eventkitcontrol lets you list and manage Apple Calendar events and Reminders
+from the macOS command line. You can preview every change before saving it;
+event, reminder, and calendar deletions require confirmation. Output defaults
+to JSON for scripts, with CSV and plain text also available.
+
+See the [changelog](CHANGELOG.md) for the complete first-release scope and the
+reasoning behind intentional compatibility decisions.
 
 ## Features
 
 - List, create, update, and delete calendar events
 - List, create, update, complete, and delete reminders
-- Quick date-range shortcuts: `eventkitcontrol today`, `eventkitcontrol tomorrow`, `eventkitcontrol next`
+- Preview every change with `--dry-run`; event, reminder, and calendar
+  deletions require explicit confirmation
+- Update or delete one recurring occurrence without accidentally targeting a
+  different one
+- Quick date-range shortcuts: `today`, `tomorrow`, and `next`
 - Search and filter (`--search`, `--availability busy`) without piping through jq
-- Calendar aliases (use friendly names instead of UUIDs)
+- Calendar and reminder-list aliases (use friendly names instead of UUIDs)
 - JSON, CSV, or plain-text output (`--format json|csv|text`)
 - RFC 3339 or jq-friendly compact timestamps (`--time-format rfc3339|compact`)
-- Full EventKit integration with proper permission handling
+- Requests Calendar or Reminders permission only when a command needs it
+- Uses Apple's documented EventKit APIs
 - Support for iCloud, Exchange, and local calendars
+- Signed and Apple-notarized Apple Silicon `.pkg` installer with no installer
+  scripts
 
 ## Requirements
 
@@ -31,10 +41,10 @@ formats available for scripting.
 
 ### Signed package
 
-Tagged releases publish an Apple Silicon product archive signed with Developer
-ID, notarized by Apple, and stapled for offline Gatekeeper validation. Installer
-rejects Intel Macs and macOS releases older than 14.0 before changing the
-system. Replace the tag below with the release you want:
+Tagged releases provide a signed, Apple-notarized `.pkg` for Apple Silicon
+Macs. macOS can verify it even when offline. The installer stops before making
+changes on Intel Macs or macOS older than 14. Replace the tag below with the
+release you want:
 
 ```bash
 TAG=v1.0.0
@@ -46,8 +56,14 @@ sudo installer -pkg "$PACKAGE" -target /
 eventkitcontrol --version
 ```
 
-The product archive installs `/usr/local/bin/eventkitcontrol`. It contains no
-installer scripts and does not install an upstream compatibility command.
+For the familiar macOS install flow, stop after the checksum succeeds and
+double-click the `.pkg` in Finder (or run `open "$PACKAGE"`). Apple Installer
+will show the destination and authorization steps; the `sudo installer`
+command above is the scriptable equivalent.
+
+The installer puts `eventkitcontrol` at `/usr/local/bin/eventkitcontrol`. It
+contains no installer scripts and does not install the original project's
+command name.
 
 Install a newer PKG the same way to upgrade. To uninstall the executable and
 forget its installer receipt:
@@ -70,12 +86,13 @@ cd eventkitcontrol
 ./Scripts/build-artifact.sh
 ```
 
-The script builds ARM64 from the checked-in dependency lock, applies an ad-hoc
-Hardened Runtime signature with the EventKit entitlements, validates the binary,
-removes its isolated build scratch data, and prints the binary's unique path
-under `.build/eventkitcontrol-artifact.*`. It creates no archive and installs
-nothing. Successful `main` CI runs also expose short-lived, ad-hoc-signed
-snapshot archives; tagged PKGs are the supported distribution.
+The script builds an Apple Silicon executable using the dependency versions
+recorded in the repository. It signs the local build so macOS can request
+Calendar and Reminders access, checks the result, removes temporary build files,
+and prints the executable's path under `.build/eventkitcontrol-artifact.*`. It
+does not install anything or create a release package. Successful `main` CI runs
+also offer temporary test builds; signed tagged packages remain the supported
+way to install a release.
 
 ### Permissions
 
@@ -107,7 +124,71 @@ eventkitcontrol list calendars
       "type": "event",
       "source": { "id": "SOURCE_ID", "title": "iCloud", "type": "calDAV" },
       "color": "#0088FF",
-      "allowsModifications": true
+      "allowsModifications": true,
+      "immutable": false,
+      "allowedEntityTypes": 1
+    }
+  ],
+  "count": 1,
+  "status": "success"
+}
+```
+
+### List Reminder Lists
+
+Reminder lists are deliberately discovered separately so this command requests
+only Reminders access:
+
+```bash
+eventkitcontrol list reminder-lists
+```
+
+The output uses the same calendar-object fields as `list calendars`, under the
+`reminderLists` key with `type: "reminder"`. Use a returned ID directly or give
+it an alias:
+
+```json
+{
+  "count": 1,
+  "reminderLists": [
+    {
+      "id": "REMINDER-LIST-ID",
+      "title": "Groceries",
+      "type": "reminder",
+      "source": { "id": "SOURCE_ID", "title": "iCloud", "type": "calDAV" },
+      "color": "#FF9500",
+      "allowsModifications": true,
+      "immutable": false,
+      "allowedEntityTypes": 2
+    }
+  ],
+  "status": "success"
+}
+```
+
+```bash
+eventkitcontrol alias set groceries REMINDER_LIST_ID
+```
+
+### List Sources
+
+List the account sources available to EventKit for an explicit
+event-calendar creation attempt. A source can still reject creation because of
+its account type, permissions, or server policy:
+
+```bash
+eventkitcontrol list sources
+```
+
+```json
+{
+  "count": 1,
+  "sources": [
+    {
+      "id": "SOURCE_ID",
+      "title": "iCloud",
+      "type": "calDAV",
+      "eventCalendarCount": 4
     }
   ],
   "status": "success"
@@ -120,7 +201,6 @@ Choose an account source explicitly; eventkitcontrol never guesses an iCloud or 
 account:
 
 ```bash
-eventkitcontrol list sources
 eventkitcontrol calendar create --source SOURCE_ID --title "Project X" --color "#FF5500"
 ```
 
@@ -142,18 +222,19 @@ eventkitcontrol calendar delete CALENDAR_ID --confirm CALENDAR_ID
 ```
 
 Calendar update and deletion operate on event-only calendars. Reminder lists
-are listed separately with `eventkitcontrol list reminder-lists` and are not deletable by
-this CLI.
+are listed separately and are not deletable by this CLI.
 
 ### Aliases
 
-Use friendly names instead of UUIDs. Aliases work anywhere a calendar ID is accepted.
+Use friendly names instead of UUIDs. Aliases work anywhere an event-calendar
+or reminder-list ID is accepted.
 
 **Set alias:**
 
 ```bash
 eventkitcontrol alias set work "CA513B39-1659-4359-8FE9-0C2A3DCEF153"
-eventkitcontrol alias set personal "4E367C6F-354B-4811-935E-7F25A1BB7D39"
+eventkitcontrol alias set personal "EVENT-CALENDAR-ID"
+eventkitcontrol alias set groceries "REMINDER-LIST-ID"
 ```
 
 Use `--dry-run` to securely load the current config and preview an alias's
@@ -171,7 +252,7 @@ eventkitcontrol alias list
 {
   "aliases": [
     { "name": "groceries", "id": "E30AE972-8F29-40AF-BFB9-E984B98B08AB" },
-    { "name": "personal", "id": "4E367C6F-354B-4811-935E-7F25A1BB7D39" },
+    { "name": "personal", "id": "PERSONAL-EVENT-CALENDAR-ID" },
     { "name": "work", "id": "CA513B39-1659-4359-8FE9-0C2A3DCEF153" }
   ],
   "count": 3,
@@ -194,9 +275,12 @@ eventkitcontrol list events --calendar "CA513B39-1659-4359-8FE9-0C2A3DCEF153" --
 eventkitcontrol list events --calendar work --from "2026-01-01T00:00:00Z" --to "2026-01-31T23:59:59Z"
 ```
 
-Aliases are stored in `~/.eventkitcontrol/config.json`. The directory, lock, and config
-must be owned by the current user, use private `0700`/`0600` modes, and have no
-extended ACLs; unsafe entries are rejected rather than silently trusted.
+Aliases are stored in `~/.eventkitcontrol/config.json`. The directory, lock,
+and config must be owned by the current user and have no extended ACLs, unsafe
+links, or unexpected file types. At this canonical path, existing POSIX modes
+are repaired to private `0700`/`0600` values before use; override directories
+must already be private. Other unsafe entries are rejected rather than silently
+trusted.
 
 ## Events
 
@@ -219,17 +303,20 @@ eventkitcontrol list events --calendar work,personal --from "2026-01-01T00:00:00
 Narrow the result set further with `--search` (case-insensitive substring across title, location, and notes) and `--availability` (one of `busy`, `free`, `tentative`, `unavailable`, `notSupported`). Both filters compose with each other and with the calendar/date selection:
 
 ```bash
+FROM="2026-01-15T00:00:00Z"
+TO="2026-01-16T00:00:00Z"
+
 # Just the standup-related events
-eventkitcontrol list events --calendar work --from "$NOWISH" --to "$TOMORROW" --search standup
+eventkitcontrol list events --calendar work --from "$FROM" --to "$TO" --search standup
 
 # Only "busy" events — useful for finding actual blocked-out time
-eventkitcontrol list events --calendar work --from "$NOWISH" --to "$TOMORROW" --availability busy
+eventkitcontrol list events --calendar work --from "$FROM" --to "$TO" --availability busy
 
 # Combine — standups marked busy
-eventkitcontrol list events --calendar work --from "$NOWISH" --to "$TOMORROW" --search standup --availability busy
+eventkitcontrol list events --calendar work --from "$FROM" --to "$TO" --search standup --availability busy
 ```
 
-**Output:**
+**Example output (abridged):**
 
 ```json
 {
@@ -256,6 +343,12 @@ eventkitcontrol list events --calendar work --from "$NOWISH" --to "$TOMORROW" --
   "status": "success"
 }
 ```
+
+Every event object also carries `relativeAlarmOffsetsSeconds`, detailed
+`alarms`, detailed `recurrenceRules`, a recurring-occurrence `selector` or
+`null`, `detached`, `availability`, and `attendees`. `url` is present when the
+event has one. The same event object is used by list, show, add, update, and
+dry-run output.
 
 ### Quick date ranges: `today` / `tomorrow` / `next`
 
@@ -326,6 +419,19 @@ eventkitcontrol add event \
   --alarms "10,60"
 ```
 
+`--alarms` takes comma-separated minutes from the event start. `10` and `-10`
+both mean 10 minutes before the event; write `+10` to mean 10 minutes after:
+
+| Input | Meaning | EventKit offset |
+| --- | --- | --- |
+| `10` | 10 minutes before | `-600` seconds |
+| `-10` | 10 minutes before | `-600` seconds |
+| `+10` | 10 minutes after | `600` seconds |
+
+The command rejects the whole list if any value is missing, invalid, repeated,
+or more than 365 days from the event. Up to 64 alarms are allowed, and nothing
+is changed when the list is rejected.
+
 Recurring event (weekly):
 
 ```bash
@@ -342,6 +448,27 @@ eventkitcontrol add event \
 Every recurrence must choose exactly one end mode:
 `--recurrence-end-count`, `--recurrence-end-date`, or `--recurrence-no-end`.
 
+Recurrence options that take comma-separated lists reject invalid or duplicate
+choices, even when the same choice is written differently, such as
+`mon,monday`. `--recurrence-interval` is valid for every frequency. Beyond
+that shared interval and the required end mode, these options are available:
+
+| Frequency | Options available for that frequency |
+| --- | --- |
+| `daily` | none |
+| `weekly` | `--recurrence-days` |
+| `monthly` | `--recurrence-days` or `--recurrence-days-of-month`, plus optional `--recurrence-set-positions` |
+| `yearly` | `--recurrence-days`, `--recurrence-months`, `--recurrence-weeks-of-year`, `--recurrence-days-of-year`, and optional `--recurrence-set-positions` |
+
+Monthly and yearly weekdays may include a position such as `1mon` for the first
+Monday or `-1fri` for the last Friday.
+`--recurrence-months` accepts names or `1` through `12`. Month days, year
+weeks, year days, and set positions accept positive or negative numbers, but
+not zero. Positive values count forward and negative values count backward, so
+`-1` means “last.” Their largest allowed absolute values are `31`, `53`, `366`,
+and `366`, respectively. Set positions require another compatible monthly or
+yearly option. Incompatible combinations fail before requesting access.
+
 Geocoding is off by default. Opt in only when you want location text sent to
 Apple's geocoder:
 
@@ -355,7 +482,7 @@ eventkitcontrol add event \
   --geocode-location
 ```
 
-**Output:**
+**Example output (abridged):**
 
 ```json
 {
@@ -389,15 +516,28 @@ Date changes are the exception: supply `--start`, `--end`, and
 `--all-day true|false` together so the CLI can validate the complete range.
 Use `--clear-alarms` for an intentional removal; an empty or malformed
 `--alarms` value is rejected without changing existing alarms.
-Both `--alarms` and `--clear-alarms` replace every existing EventKit alarm
-object. That includes absolute alarms and any custom action, sound/email/
-procedure, proximity, or structured-location metadata. A dry run reports the
-complete before/after alarm set and this replacement scope before anything is
-saved.
 
-Alarm CLI input is expressed in minutes. Event output names EventKit's raw
-values explicitly as `relativeAlarmOffsetsSeconds` and `offsetSeconds`, so the
-units cannot be mistaken for reusable `--alarms` input.
+**Warning:** changing or clearing alarms replaces the event's entire alarm
+list. This discards any fixed-date or location-based alarms, custom sounds,
+email actions, or other alarm details that the command cannot recreate.
+Preview the operation with `--dry-run` first; the preview shows the complete
+before-and-after alarm lists and explains what would be lost.
+
+Changing `--location` can also remove coordinates and other map information
+stored by Calendar. Without `--geocode-location`, the text changes and the old
+map information is cleared. With the flag, new map information replaces it only
+after lookup succeeds; a failed lookup leaves the event unchanged. A dry run
+reports this under `changes.structuredLocation`.
+
+JSON reports relative alarm offsets in seconds under
+`relativeAlarmOffsetsSeconds` and `offsetSeconds`, while `--alarms` accepts
+minutes. Do not paste those numbers directly back into `--alarms`. Each alarm
+entry also says whether it is relative or fixed to a date and whether it
+contains custom action, proximity, location, email, or sound information.
+
+For recurring events, `recurrenceRules` describes the stored rule and
+`selector` identifies one occurrence. Copy `selector.occurrenceDate` to
+`--occurrence` and `selector.expectedStart` to `--expected-start` unchanged.
 
 With multiple fields:
 
@@ -414,7 +554,7 @@ eventkitcontrol update event EVENT_ID \
   --url "https://example.com/meeting"
 ```
 
-**Output:**
+**Example output (abridged):**
 
 ```json
 {
@@ -447,7 +587,7 @@ eventkitcontrol delete event EVENT_ID --dry-run
 eventkitcontrol delete event EVENT_ID --yes
 ```
 
-**Output:**
+**Example output (abridged):**
 
 ```json
 {
@@ -464,28 +604,28 @@ eventkitcontrol delete event EVENT_ID --yes
 All reminders:
 
 ```bash
-eventkitcontrol list reminders --list personal
+eventkitcontrol list reminders --list groceries
 ```
 
 Only incomplete:
 
 ```bash
-eventkitcontrol list reminders --list personal --completed false
+eventkitcontrol list reminders --list groceries --completed false
 ```
 
 Only completed:
 
 ```bash
-eventkitcontrol list reminders --list personal --completed true
+eventkitcontrol list reminders --list groceries --completed true
 ```
 
 Substring filter on title and notes:
 
 ```bash
-eventkitcontrol list reminders --list personal --search milk
+eventkitcontrol list reminders --list groceries --search milk
 ```
 
-**Output:**
+**Example output (abridged):**
 
 ```json
 {
@@ -521,16 +661,20 @@ eventkitcontrol show reminder REMINDER_ID
 Simple reminder:
 
 ```bash
-eventkitcontrol add reminder --list personal --title "Call dentist"
+eventkitcontrol add reminder --list groceries --title "Call dentist"
 ```
 
 With due date:
 
 ```bash
-eventkitcontrol add reminder --list personal --title "Submit expense report" --due "2026-01-25T09:00:00Z"
+eventkitcontrol add reminder --list groceries --title "Submit expense report" --due "2026-01-25T09:00:00Z"
 ```
 
-With priority and notes (priority: 0=none, 1=high, 5=medium, 9=low):
+Every integer priority from `0` through `9` is accepted. EventKit convention
+uses `0` for none, `1` for high, `5` for medium, and `9` for low; intermediate
+values preserve their exact EventKit priority.
+
+With priority and notes:
 
 ```bash
 eventkitcontrol add reminder \
@@ -541,7 +685,7 @@ eventkitcontrol add reminder \
   --notes "Check expiration date"
 ```
 
-**Output:**
+**Example output (abridged):**
 
 ```json
 {
@@ -583,7 +727,7 @@ eventkitcontrol update reminder REMINDER_ID --priority 1 --due "2026-03-10T09:00
 eventkitcontrol update reminder REMINDER_ID --completed true
 ```
 
-**Output:**
+**Example output (abridged):**
 
 ```json
 {
@@ -612,7 +756,7 @@ eventkitcontrol update reminder REMINDER_ID --completed true
 eventkitcontrol complete reminder REMINDER_ID
 ```
 
-**Output:**
+**Example output (abridged):**
 
 ```json
 {
@@ -647,6 +791,7 @@ offsets are rejected:
 | UTC | `2026-01-15T09:00:00Z` | 9:00 AM UTC |
 | Offset with colon | `2026-01-15T09:00:00+10:00` | 9:00 AM AEST (RFC 3339) |
 | Compact offset | `2026-01-15T09:00:00+1000` | Same instant, jq-style `%z` form |
+| Fractional seconds | `2026-01-15T09:00:00.123456789Z` | One through nine fractional digits |
 
 Timestamps in **output** are rendered in your local timezone and are always valid input, so values round-trip between commands. The rendering is controlled by `--time-format` on every command:
 
@@ -666,24 +811,88 @@ day, matching EventKit. A one-day event on June 3 uses
 `--start 2026-06-03 --end 2026-06-04 --all-day`. All-day values are also emitted
 date-only.
 
-## Mutation safety and scripting
+## Previewing and confirming changes
 
-Every command that changes EventKit or alias configuration accepts `--dry-run`.
-Dry runs validate and preview but do not save, delete, geocode, or rewrite the
-alias file. Event and reminder deletion additionally require `--yes`; calendar
-deletion requires `--confirm` with the exact resolved calendar ID.
+Every command that changes calendar, reminder, or alias data supports
+`--dry-run`. It performs the same checks and shows what would change, but does
+not save or delete anything, send an address for geocoding, or change the alias
+file. Real event and reminder deletions require `--yes`; calendar deletion
+requires `--confirm` with the actual calendar ID, not an alias.
 
-Recurring event show/update/delete commands require the `--occurrence` and
-`--expected-start` pair shown in list/show output. Supplying the pair for a
-non-recurring event is also rejected, preventing stale selectors from targeting
-the wrong item. The original occurrence is always emitted as a timestamp—even
-when a detached occurrence is currently all-day—so its exact recurring slot is
-not lost.
+Every successful change includes `dryRun` and `applied`, so scripts can tell a
+preview from a saved change. Update previews also include a field-by-field
+`changes` object. For example, this command:
 
-Errors are written to stderr as the selected structured format. Exit statuses
-are stable: `0` success, `64` invalid input, `1` operation failure, and `2`
-permission denial. CSV output neutralises spreadsheet-formula prefixes, while
-text output renders terminal control characters visibly.
+```bash
+eventkitcontrol update event EVENT_ID --title "New title" --dry-run
+```
+
+returns the complete current event snapshot alongside the proposed change:
+
+```json
+{
+  "applied": false,
+  "changes": {
+    "title": { "after": "New title", "before": "Old title" }
+  },
+  "dryRun": true,
+  "event": {
+    "alarms": [],
+    "allDay": false,
+    "attendees": [],
+    "availability": "busy",
+    "calendar": { "id": "CALENDAR_ID", "title": "Work" },
+    "detached": false,
+    "endDate": "2026-02-15T15:00:00Z",
+    "hasAlarms": false,
+    "hasRecurrenceRules": false,
+    "id": "EVENT_ID",
+    "location": null,
+    "notes": null,
+    "recurrenceRules": [],
+    "relativeAlarmOffsetsSeconds": [],
+    "selector": null,
+    "startDate": "2026-02-15T14:00:00Z",
+    "title": "Old title"
+  },
+  "geocodingWouldRun": false,
+  "message": "Event update validated; no event was saved.",
+  "status": "success"
+}
+```
+
+For an alarm update, `changes.alarms` contains the complete old and proposed
+alarm lists, their counts, and a warning about details the command cannot
+recreate.
+
+For a recurring event, copy both values from its `selector` object into
+`--occurrence` and `--expected-start`. If either value is missing or no longer
+matches, the command stops; list the event again to get fresh values. Supplying
+the pair for a non-recurring event is also rejected, which prevents an old
+selector from targeting the wrong item.
+
+For scripts, errors are written to the standard error stream in the selected
+format. Exit statuses are stable: `0` means success, `64` invalid input, `1` an
+operation failure, and `2` permission denial. CSV output prevents calendar text
+from becoming a spreadsheet formula, while plain-text output displays terminal
+control characters instead of executing them.
+
+## Current limitations
+
+- Travel time is not shown or changed because Apple provides no public EventKit
+  API for it. The [changelog](CHANGELOG.md) explains why the earlier option was
+  removed rather than kept as an unreliable promise.
+- The command can create alarms before or after an event. It can show fixed-date
+  alarms and custom details, but cannot recreate them if you replace the alarm
+  list.
+- Recurrence rules can be created but not edited. Updates and deletions affect
+  one explicitly selected occurrence, not the whole series or all future
+  occurrences.
+- Events and reminders cannot be moved to another calendar or list. Attendees
+  and reminder URLs are read-only.
+- Event URLs can be set but not cleared, and reminder due dates cannot be
+  cleared.
+- Reminder lists can be listed and used, but not created, changed, or deleted.
 
 ## Scripting Examples
 
@@ -691,7 +900,7 @@ text output renders terminal control characters visibly.
 
 ```bash
 CALENDAR_ID=$(eventkitcontrol list calendars | jq -r '.calendars[] | select(.title == "Work") | .id')
-echo $CALENDAR_ID
+echo "$CALENDAR_ID"
 ```
 
 ### List today's events
@@ -731,7 +940,7 @@ eventkitcontrol add event \
 ### Count incomplete reminders
 
 ```bash
-eventkitcontrol list reminders --list "$LIST_ID" --completed false | jq '.count'
+eventkitcontrol list reminders --list groceries --completed false | jq '.count'
 ```
 
 ### Export events to CSV
@@ -754,7 +963,7 @@ Nested objects flatten to dot-notated columns (e.g., `calendar.id`, `calendar.ti
 `--format text` emits one `key: value` line per field, with a blank line between items — handy for `grep`, eyeballing, or quick `head`/`tail` checks:
 
 ```bash
-eventkitcontrol list events --calendar work --from "$TODAY" --to "$TOMORROW" --format text
+eventkitcontrol today --calendar work --format text
 ```
 
 ## Error Handling
@@ -765,7 +974,7 @@ JSON errors include a stable code and the corresponding process exit status:
 ```json
 {
   "status": "error",
-  "error": "Calendar not found with ID: invalid-id",
+  "error": "Event calendar not found with ID: invalid-id",
   "code": "operation_failed",
   "exitCode": 1
 }
@@ -774,7 +983,7 @@ JSON errors include a stable code and the corresponding process exit status:
 Common errors:
 
 - `Permission denied`: Grant access in System Settings → Privacy & Security → Calendars/Reminders
-- `Calendar not found`: Check calendar ID with `eventkitcontrol list calendars`
+- `Event calendar not found`: Check the calendar ID with `eventkitcontrol list calendars`
 - `Invalid date format`: Use ISO 8601 (e.g., `2026-01-15T09:00:00Z`, `+10:00`, or `+1000` offsets — see [Date Format](#date-format))
 
 Exit codes: `0` success, `1` failure, `2` permission denied, `64` invalid usage (bad flags/values).
@@ -793,11 +1002,19 @@ eventkitcontrol add event --help
 
 ## Contributing
 
-Pull requests welcome.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development checks, focused
+commit guidance, and the process for carefully reimplementing a safety fix for
+the original project without exporting this fork's identity or product policy.
 
 ## Project lineage
 
-eventkitcontrol began as a fork of
-[ekctl](https://github.com/schappim/ekctl), originally created by Marcus Schappi.
-It now has its own command, configuration, bundle identity, and distribution and
-does not maintain binary or command compatibility with upstream.
+eventkitcontrol began from
+[an earlier macOS EventKit CLI codebase at this immutable fork point](https://github.com/unixfg/eventkitcontrol/commit/79a7c86124c04a93180ce2aeb281a5e3e483f88a),
+originally created by [Marcus Schappi](https://github.com/schappim). It now has
+its own command, configuration, bundle identity, and distribution and does not
+maintain binary, command, output, or configuration compatibility with the
+original project.
+
+eventkitcontrol is an independent project and is not affiliated with or
+endorsed by Apple Inc. EventKit and macOS are referenced only to describe the
+Apple technologies with which the tool interoperates.

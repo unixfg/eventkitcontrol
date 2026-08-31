@@ -39,3 +39,7 @@ dist/
 *.d
 *.o
 *.swiftdeps
+
+# Python validation helpers
+__pycache__/
+*.py[cod]
