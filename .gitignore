@@ -1,7 +1,6 @@
 # Swift Package Manager
 .build/
 .swiftpm/
-Package.resolved
 
 # Xcode
 *.xcodeproj/
@@ -36,6 +35,7 @@ DerivedData/
 *~
 
 # Build artifacts
+dist/
 *.d
 *.o
 *.swiftdeps

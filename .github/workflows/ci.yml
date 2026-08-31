@@ -2,17 +2,118 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  test:
-    runs-on: macos-15
+  shell:
+    name: Shell and identity checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Build
-        run: swift build
+      - name: Check shell syntax
+        run: bash -n Scripts/*.sh
 
-      - name: Test
-        run: swift test
+      - name: Run ShellCheck
+        run: shellcheck Scripts/*.sh
+
+      - name: Reject retired upstream identity
+        run: |
+          set -Eeuo pipefail
+          test ! -e build.sh
+          legacy_name='e''kctl'
+          if git ls-files | grep -iF -- "$legacy_name"; then
+            echo "error: tracked paths must use the eventkitcontrol identity" >&2
+            exit 1
+          fi
+          if git grep -n -i "$legacy_name" -- ':!README.md'; then
+            echo "error: upstream compatibility references are only allowed in README lineage" >&2
+            exit 1
+          fi
+
+  swift:
+    name: Swift 6 / macOS 26 / ARM64
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report and validate toolchain
+        run: |
+          set -Eeuo pipefail
+          xcodebuild -version
+          swift --version
+          test "$(uname -m)" = arm64
+          XCODE_VERSION="$(xcodebuild -version | awk 'NR == 1 && $1 == "Xcode" { print $2 }')"
+          XCODE_MAJOR="${XCODE_VERSION%%.*}"
+          [[ "$XCODE_MAJOR" =~ ^[0-9]+$ ]] && (( XCODE_MAJOR >= 26 ))
+          [[ "$(swift --version)" == *"Swift version 6."* ]]
+
+      - name: Validate package and privacy metadata
+        run: |
+          set -Eeuo pipefail
+          ./Scripts/validate-lockfile.sh
+          swift package dump-package >/dev/null
+          plutil -lint Info.plist eventkitcontrol.entitlements
+
+      - name: Build executable from locked dependencies
+        run: |
+          swift build \
+            --product eventkitcontrol \
+            --arch arm64 \
+            --disable-automatic-resolution
+
+      - name: Run tests from locked dependencies
+        run: swift test --disable-automatic-resolution
+
+      - name: Build and validate release-mode snapshot binary
+        run: ./Scripts/build-artifact.sh --output-dir dist
+
+      - name: Build and validate unsigned product archive structure
+        run: |
+          ./Scripts/build-package.sh \
+            --signing-mode unsigned \
+            --output dist/eventkitcontrol-ci-unsigned.pkg \
+            dist/eventkitcontrol
+
+      - name: Verify dependency lock is unchanged
+        run: git diff --exit-code -- Package.resolved
+
+      - name: Package main snapshot
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          SNAPSHOT_ARCHIVE: eventkitcontrol-${{ github.sha }}-macos-arm64.tar.gz
+        run: |
+          set -Eeuo pipefail
+          COPYFILE_DISABLE=1 tar -C dist -czf "$SNAPSHOT_ARCHIVE" eventkitcontrol
+          shasum -a 256 "$SNAPSHOT_ARCHIVE"
+
+      - name: Upload main snapshot
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: eventkitcontrol-${{ github.sha }}-macos-arm64.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14

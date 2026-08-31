@@ -9,6 +9,16 @@ import Foundation
 /// following day, so EventKit's `predicateForEvents(withStart:end:)` —
 /// which is inclusive on both ends — won't double-count midnight events.
 public enum DateRanges {
+    /// EventKit predicates are intentionally kept within a four-year window.
+    /// Bounding this also prevents integer/date-arithmetic overflow from CLI
+    /// input before any permission request is made.
+    public static let maximumNextWindowDays = 1_461
+
+    public static func isSupportedEventQuery(start: Date, end: Date) -> Bool {
+        guard start < end else { return false }
+        return end.timeIntervalSince(start)
+            <= TimeInterval(maximumNextWindowDays) * 86_400
+    }
 
     /// Range covering the local day containing `now`.
     public static func today(now: Date = Date(),
@@ -27,14 +37,18 @@ public enum DateRanges {
         return (start, end)
     }
 
-    /// Range from `now` to `now + days` (used by `ekctl next`'s lookahead
+/// Range from `now` to `now + days` (used by `eventkitcontrol next`'s lookahead
     /// window). Uses calendar arithmetic so DST transitions are handled
     /// correctly — straight `TimeInterval(days * 86400)` arithmetic would
     /// be off by an hour twice a year.
     public static func nextWindow(now: Date = Date(),
                                   days: Int,
-                                  calendar: Calendar = .current) -> (start: Date, end: Date) {
-        let end = calendar.date(byAdding: .day, value: days, to: now)!
+                                  calendar: Calendar = .current) -> (start: Date, end: Date)? {
+        guard (1...maximumNextWindowDays).contains(days),
+              let end = calendar.date(byAdding: .day, value: days, to: now)
+        else {
+            return nil
+        }
         return (now, end)
     }
 }

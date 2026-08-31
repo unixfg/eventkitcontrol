@@ -1,36 +1,57 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
+import Foundation
 import PackageDescription
 
+let infoPlistPath = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .appendingPathComponent("Info.plist")
+    .path
+
 let package = Package(
-    name: "ekctl",
+    name: "eventkitcontrol",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
+    ],
+    products: [
+        .executable(name: "eventkitcontrol", targets: ["EventKitControl"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0")
+        .package(url: "https://github.com/apple/swift-argument-parser.git", exact: "1.8.2")
     ],
     targets: [
         .target(
-            name: "ekctlCore",
+            name: "EventKitControlCore",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
-            path: "Sources/ekctlCore"
+            path: "Sources/EventKitControlCore"
         ),
         .executableTarget(
-            name: "ekctl",
+            name: "EventKitControl",
             dependencies: [
-                "ekctlCore",
+                "EventKitControlCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
-            path: "Sources/ekctl"
+            path: "Sources/EventKitControl",
+            linkerSettings: [
+                .unsafeFlags(
+                    [
+                        "-Xlinker", "-sectcreate",
+                        "-Xlinker", "__TEXT",
+                        "-Xlinker", "__info_plist",
+                        "-Xlinker", infoPlistPath,
+                    ],
+                    .when(platforms: [.macOS])
+                )
+            ]
         ),
         .testTarget(
-            name: "ekctlTests",
+            name: "EventKitControlTests",
             dependencies: [
-                "ekctlCore",
+                "EventKitControlCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
-            ]
+            ],
+            path: "Tests/EventKitControlTests"
         )
     ]
 )

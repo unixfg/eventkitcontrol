@@ -1,46 +1,32 @@
 import ArgumentParser
 import EventKit
-import XCTest
-import ekctlCore
+import EventKitControlCore
 import Foundation
+import XCTest
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Test-only helpers ─────────────────────────────────────────────────────────
-// These small functions mirror the inline logic inside run() methods in Ekctl.swift. 
-// They can't be imported because they live in the executable target, so we keep slim wrappers here. 
-// Each one exactly matches the production code — if the production code changes, the behaviour test will catch the drift.
+// These thin wrappers call the production validation APIs while expressing the
+// optional-value behavior used by command flags.
 
-/// Mirrors: parseDateOption() in Ekctl.swift, which delegates to the real
-/// `DateParsing.parse` — so unlike the other mirrors this one exercises the
-/// actual production parser.
+/// Exercises the production date parser.
 func validateDate(_ input: String) -> Date? {
     DateParsing.parse(input)
 }
 
-/// Mirrors: TimeInterval(ttInt * 60) in AddEvent.run() / UpdateEvent.run()
-func travelTimeSeconds(from minuteString: String) -> TimeInterval? {
-    guard let minutes = Int(minuteString) else { return nil }
-    return TimeInterval(minutes * 60)
-}
-
-/// Mirrors: (recurrenceInterval.flatMap(Int.init)) ?? 1 in AddEvent.run()
-func recurrenceInterval(from string: String?) -> Int {
-    string.flatMap(Int.init) ?? 1
-}
-
-/// Mirrors: Int(priority) in AddReminder.run() / UpdateReminder.run()
+/// Exercises the production priority validator.
 func parsePriority(_ string: String?) -> Int? {
-    guard let string = string else { return nil }
-    return Int(string)
+    guard let string else { return nil }
+    return try? InputValidation.parsePriority(string)
 }
 
-/// The real shared implementation used by AddEvent.run() / UpdateEvent.run()
-/// — no longer a mirror.
+/// Exercises the production alarm parser.
 func parseAlarms(_ string: String?) -> [Double]? {
-    AlarmParsing.parse(string)
+    guard let string else { return nil }
+    return try? AlarmParsing.parseRequired(string)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,7 +201,7 @@ final class OutputFormatTests: XCTestCase {
     func testCSVEscapesFieldsContainingNewline() {
         let events: [[String: Any]] = [["notes": "line one\nline two"]]
         let output = JSONOutput.success(["events": events])
-        XCTAssertTrue(output.format(.csv).contains("\"line one\nline two\""))
+        XCTAssertTrue(output.format(.csv).contains("line one\\u{000A}line two"))
     }
 
     func testCSVDoesNotEscapePlainField() {
@@ -262,8 +248,8 @@ final class OutputFormatTests: XCTestCase {
         let csv = output.format(.csv)
         let lines = csv.components(separatedBy: "\r\n")
         XCTAssertEqual(lines.count, 2)
-        XCTAssertEqual(lines[0], "error,status")
-        XCTAssertEqual(lines[1], "Calendar not found,error")
+        XCTAssertEqual(lines[0], "code,error,exitCode,status")
+        XCTAssertEqual(lines[1], "operation_failed,Calendar not found,1,error")
     }
 
     // MARK: - CSV: value coercion
@@ -310,8 +296,7 @@ final class OutputFormatTests: XCTestCase {
         XCTAssertTrue(csv.contains("shows up automatically"))
     }
 
-    /// Explicit regression guard for the two fields the maintainer specifically
-    /// worried about (`availability` from issue #2 and `attendees` from PR #6).
+    /// Explicit regression guard for representative scalar and nested fields.
     /// Both must round-trip through CSV without any per-field code.
     func testCSVIncludesAvailabilityAndAttendeesAutomatically() {
         let events: [[String: Any]] = [[
@@ -719,30 +704,53 @@ final class DateRangesTests: XCTestCase {
 
     // MARK: - nextWindow()
 
-    func testNextWindowStartsAtNow() {
+    func testNextWindowStartsAtNow() throws {
         let cal = calendar()
         let now = date(2026, 3, 15, 14, 30, 45, in: cal)
-        let (start, _) = DateRanges.nextWindow(now: now, days: 7, calendar: cal)
+        let (start, _) = try XCTUnwrap(
+            DateRanges.nextWindow(now: now, days: 7, calendar: cal))
         XCTAssertEqual(start, now, "next-window start should be exactly `now`, not midnight")
     }
 
-    func testNextWindowEndIsNowPlusDays() {
+    func testNextWindowEndIsNowPlusDays() throws {
         let cal = calendar()
         let now = date(2026, 3, 15, 14, 30, in: cal)
-        let (_, end) = DateRanges.nextWindow(now: now, days: 7, calendar: cal)
+        let (_, end) = try XCTUnwrap(
+            DateRanges.nextWindow(now: now, days: 7, calendar: cal))
         let endComponents = cal.dateComponents([.year, .month, .day, .hour, .minute], from: end)
         XCTAssertEqual(endComponents.day, 22)
         XCTAssertEqual(endComponents.hour, 14)
         XCTAssertEqual(endComponents.minute, 30)
     }
 
-    func testNextWindowHandlesYearRollover() {
+    func testNextWindowHandlesYearRollover() throws {
         let cal = calendar()
         let now = date(2026, 12, 28, 10, 0, in: cal)
-        let (_, end) = DateRanges.nextWindow(now: now, days: 7, calendar: cal)
+        let (_, end) = try XCTUnwrap(
+            DateRanges.nextWindow(now: now, days: 7, calendar: cal))
         XCTAssertEqual(cal.component(.year, from: end), 2027)
         XCTAssertEqual(cal.component(.month, from: end), 1)
         XCTAssertEqual(cal.component(.day, from: end), 4)
+    }
+
+    func testNextWindowRejectsNonPositiveAndExtremeValues() {
+        XCTAssertNil(DateRanges.nextWindow(days: 0))
+        XCTAssertNil(DateRanges.nextWindow(days: -1))
+        XCTAssertNil(DateRanges.nextWindow(days: Int.max))
+        XCTAssertNotNil(DateRanges.nextWindow(days: DateRanges.maximumNextWindowDays))
+        XCTAssertNil(DateRanges.nextWindow(days: DateRanges.maximumNextWindowDays + 1))
+    }
+
+    func testExplicitEventQueryRangeIsBounded() {
+        let start = Date(timeIntervalSince1970: 0)
+        let maximumEnd = start.addingTimeInterval(
+            TimeInterval(DateRanges.maximumNextWindowDays) * 86_400)
+        XCTAssertTrue(DateRanges.isSupportedEventQuery(start: start, end: maximumEnd))
+        XCTAssertFalse(DateRanges.isSupportedEventQuery(
+            start: start,
+            end: maximumEnd.addingTimeInterval(1)
+        ))
+        XCTAssertFalse(DateRanges.isSupportedEventQuery(start: start, end: start))
     }
 
     private func date(_ y: Int, _ m: Int, _ d: Int, _ h: Int, _ min: Int, _ sec: Int,
@@ -757,59 +765,61 @@ final class DateRangesTests: XCTestCase {
 // ─────────────────────────────────────────────────────────────────────────────
 
 final class ConfigManagerTests: XCTestCase {
-    // ConfigManager uses static methods writing to ~/.ekctl/config.json.
-    // We back up and restore the real config around each test so we don't
-    // corrupt the user's actual aliases.
+    private var containerURL: URL!
+    private var rootURL: URL!
+    private var store: ConfigStore!
 
-    private let configFile = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".ekctl/config.json")
-    private var backup: Data?
-
-    override func setUp() {
-        super.setUp()
-        backup = try? Data(contentsOf: configFile)
-        try? FileManager.default.removeItem(at: configFile)
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        containerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("eventkitcontrol-config-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: containerURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        rootURL = containerURL.appendingPathComponent("config-root", isDirectory: true)
+        store = try ConfigStore(rootURL: rootURL)
     }
 
-    override func tearDown() {
-        if let backup = backup {
-            try? backup.write(to: configFile)
-        } else {
-            try? FileManager.default.removeItem(at: configFile)
-        }
-        super.tearDown()
+    override func tearDownWithError() throws {
+        try FileManager.default.removeItem(at: containerURL)
+        store = nil
+        rootURL = nil
+        containerURL = nil
+        try super.tearDownWithError()
     }
 
     // ── Alias CRUD ───────────────────────────────────────────────────────────
 
     func testSetAndRetrieveAlias() throws {
-        try ConfigManager.setAlias(name: "work", id: "ABC-123")
-        XCTAssertEqual(ConfigManager.getAliases()["work"], "ABC-123")
+        try store.setAlias(name: "work", id: "ABC-123")
+        XCTAssertEqual(try store.getAliases()["work"], "ABC-123")
     }
 
     func testOverwriteAlias() throws {
-        try ConfigManager.setAlias(name: "work", id: "OLD-ID")
-        try ConfigManager.setAlias(name: "work", id: "NEW-ID")
-        XCTAssertEqual(ConfigManager.getAliases()["work"], "NEW-ID")
+        try store.setAlias(name: "work", id: "OLD-ID")
+        try store.setAlias(name: "work", id: "NEW-ID")
+        XCTAssertEqual(try store.getAliases()["work"], "NEW-ID")
     }
 
     func testRemoveAlias() throws {
-        try ConfigManager.setAlias(name: "work", id: "ABC-123")
-        let removed = try ConfigManager.removeAlias(name: "work")
+        try store.setAlias(name: "work", id: "ABC-123")
+        let removed = try store.removeAlias(name: "work")
         XCTAssertTrue(removed)
-        XCTAssertNil(ConfigManager.getAliases()["work"])
+        XCTAssertNil(try store.getAliases()["work"])
     }
 
     func testRemoveNonExistentAliasReturnsFalse() throws {
-        let removed = try ConfigManager.removeAlias(name: "ghost")
+        let removed = try store.removeAlias(name: "ghost")
         XCTAssertFalse(removed)
     }
 
     func testMultipleAliases() throws {
-        try ConfigManager.setAlias(name: "work",      id: "CAL-1")
-        try ConfigManager.setAlias(name: "personal",  id: "CAL-2")
-        try ConfigManager.setAlias(name: "groceries", id: "CAL-3")
-        let aliases = ConfigManager.getAliases()
+        try store.setAlias(name: "work",      id: "CAL-1")
+        try store.setAlias(name: "personal",  id: "CAL-2")
+        try store.setAlias(name: "groceries", id: "CAL-3")
+        let aliases = try store.getAliases()
         XCTAssertEqual(aliases.count, 3)
         XCTAssertEqual(aliases["personal"], "CAL-2")
     }
@@ -817,23 +827,361 @@ final class ConfigManagerTests: XCTestCase {
     // ── Alias resolution ─────────────────────────────────────────────────────
 
     func testResolveKnownAlias() throws {
-        try ConfigManager.setAlias(name: "work", id: "CA513B39-XXXX")
-        XCTAssertEqual(ConfigManager.resolveAlias("work"), "CA513B39-XXXX")
+        try store.setAlias(name: "work", id: "CA513B39-XXXX")
+        XCTAssertEqual(try store.resolveAlias("work"), "CA513B39-XXXX")
     }
 
-    func testResolvePassesThroughUnknownString() {
+    func testResolvePassesThroughUnknownString() throws {
         let rawID = "CA513B39-1659-4359-8FE9-0C2A3DCEF153"
-        XCTAssertEqual(ConfigManager.resolveAlias(rawID), rawID)
+        XCTAssertEqual(try store.resolveAlias(rawID), rawID)
     }
 
-    func testResolveEmptyConfig() {
-        XCTAssertEqual(ConfigManager.resolveAlias("anything"), "anything")
+    func testResolveEmptyConfig() throws {
+        XCTAssertEqual(try store.resolveAlias("anything"), "anything")
+        XCTAssertEqual(try store.getAliases(), [:])
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: rootURL.path),
+            "Read-only config access must not create the config directory"
+        )
+    }
+
+    func testReadWithExistingEmptyRootDoesNotCreateLockOrConfig() throws {
+        try FileManager.default.createDirectory(
+            at: rootURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        XCTAssertEqual(try store.getAliases(), [:])
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: rootURL.path),
+            [],
+            "Read-only config access must not create a lock or config file"
+        )
+    }
+
+    func testResolveCalendarIDsLoadsAliasesOnceAndRejectsEmptyEntries() throws {
+        try store.setAlias(name: "work", id: "CAL-1")
+        try store.setAlias(name: "home", id: "CAL-2")
+        XCTAssertEqual(
+            try store.resolveCalendarIDs("work, home,RAW-ID"),
+            ["CAL-1", "CAL-2", "RAW-ID"]
+        )
+        XCTAssertThrowsError(try store.resolveCalendarIDs("work,,home"))
     }
 
     // ── Config path ──────────────────────────────────────────────────────────
 
-    func testConfigPathContainsEkctl() {
-        XCTAssertTrue(ConfigManager.configPath().contains(".ekctl"))
+    func testConfigPathUsesInjectedRoot() {
+        XCTAssertEqual(store.configFileURL, rootURL.appendingPathComponent("config.json"))
+    }
+
+    func testProductionStoreUsesAbsoluteEnvironmentOverride() throws {
+        let production = try ConfigStore.production(
+            environment: ["EVENTKITCONTROL_CONFIG_DIR": rootURL.path])
+        XCTAssertEqual(production.directoryURL, rootURL.standardizedFileURL)
+        XCTAssertThrowsError(
+            try ConfigStore.production(environment: ["EVENTKITCONTROL_CONFIG_DIR": "relative/path"]))
+        XCTAssertThrowsError(
+            try ConfigStore.production(environment: ["EVENTKITCONTROL_CONFIG_DIR": "/"]))
+        XCTAssertThrowsError(
+            try ConfigStore(rootURL: URL(fileURLWithPath: "/private/tmp/../..", isDirectory: true)))
+    }
+
+    func testProductionStoreUsesIndependentEventKitControlNamespace() throws {
+        let production = try ConfigStore.production(environment: [:])
+        let expected = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".eventkitcontrol", isDirectory: true)
+            .standardizedFileURL
+        XCTAssertEqual(production.directoryURL, expected)
+    }
+
+    func testProductionOverrideRejectsBroadOrUnrelatedExistingDirectory() throws {
+        XCTAssertThrowsError(try ConfigStore.production(
+            environment: [
+                "EVENTKITCONTROL_CONFIG_DIR": FileManager.default.homeDirectoryForCurrentUser.path,
+            ]
+        ))
+
+        try FileManager.default.createDirectory(
+            at: rootURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let unrelated = rootURL.appendingPathComponent("unrelated.txt")
+        try Data("do not touch".utf8).write(to: unrelated)
+
+        XCTAssertThrowsError(try ConfigStore.production(
+            environment: ["EVENTKITCONTROL_CONFIG_DIR": rootURL.path]
+        ))
+        XCTAssertEqual(try Data(contentsOf: unrelated), Data("do not touch".utf8))
+    }
+
+    // ── Corruption and schema handling ───────────────────────────────────────
+
+    func testMalformedConfigIsPropagatedAndNeverOverwritten() throws {
+        let malformed = Data(#"{"aliases":{"work":"CAL-1"},"version":"oops"}"#.utf8)
+        try writeConfigData(malformed)
+
+        XCTAssertThrowsError(try store.setAlias(name: "home", id: "CAL-2"))
+        XCTAssertEqual(try Data(contentsOf: store.configFileURL), malformed)
+    }
+
+    func testUnsupportedVersionIsPropagated() throws {
+        let data = try configData(aliases: ["work": "CAL-1"], version: 2)
+        try writeConfigData(data)
+
+        XCTAssertThrowsError(try store.getAliases()) { error in
+            guard case ConfigStoreError.unsupportedVersion(2) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: store.configFileURL), data)
+    }
+
+    func testUnknownTopLevelFieldIsRejected() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "aliases": ["work": "CAL-1"],
+            "version": 1,
+            "futureField": true,
+        ])
+        try writeConfigData(data)
+        XCTAssertThrowsError(try store.getAliases())
+    }
+
+    func testInvalidPersistedAliasIsClassifiedAsCorruptConfig() throws {
+        try writeConfigData(try configData(
+            aliases: [" unsafe": "CAL-1"],
+            version: 1
+        ))
+
+        XCTAssertThrowsError(try store.getAliases()) { error in
+            guard case ConfigStoreError.corrupted = error else {
+                return XCTFail("Unexpected classification: \(error)")
+            }
+        }
+    }
+
+    func testOversizedConfigIsRejectedBeforeDecode() throws {
+        let oversized = Data(repeating: 0x20, count: ConfigStore.maximumConfigSize + 1)
+        try writeConfigData(oversized)
+
+        XCTAssertThrowsError(try store.getAliases()) { error in
+            guard case ConfigStoreError.configTooLarge = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    // ── File-system hardening ────────────────────────────────────────────────
+
+    func testCreatesPrivateDirectoryLockAndConfigModes() throws {
+        try store.setAlias(name: "work", id: "CAL-1")
+
+        XCTAssertEqual(try permissions(of: rootURL), 0o700)
+        XCTAssertEqual(try permissions(of: store.configFileURL), 0o600)
+        XCTAssertEqual(
+            try permissions(of: rootURL.appendingPathComponent("config.lock")),
+            0o600
+        )
+    }
+
+    func testInjectedStoreRejectsUnsafeModesWithoutChangingThem() throws {
+        try FileManager.default.createDirectory(
+            at: rootURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o755]
+        )
+        try writeConfigData(try configData(aliases: ["work": "CAL-1"], version: 1))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: store.configFileURL.path
+        )
+
+        XCTAssertThrowsError(try store.getAliases())
+        XCTAssertEqual(try permissions(of: rootURL), 0o755)
+        XCTAssertEqual(try permissions(of: store.configFileURL), 0o644)
+
+        XCTAssertThrowsError(try store.setAlias(name: "home", id: "CAL-2"))
+        XCTAssertEqual(try permissions(of: rootURL), 0o755)
+        XCTAssertEqual(try permissions(of: store.configFileURL), 0o644)
+        XCTAssertEqual(
+            try Data(contentsOf: store.configFileURL),
+            try configData(aliases: ["work": "CAL-1"], version: 1)
+        )
+    }
+
+    func testRejectsSymlinkedConfigWithoutTouchingTarget() throws {
+        try FileManager.default.createDirectory(
+            at: rootURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let target = containerURL.appendingPathComponent("target.json")
+        let targetData = Data("do not overwrite".utf8)
+        try targetData.write(to: target)
+        try FileManager.default.createSymbolicLink(
+            at: store.configFileURL,
+            withDestinationURL: target
+        )
+
+        XCTAssertThrowsError(try store.getAliases())
+        XCTAssertThrowsError(try store.setAlias(name: "work", id: "CAL-1"))
+        XCTAssertEqual(try Data(contentsOf: target), targetData)
+    }
+
+    func testRejectsSymlinkedRootDirectory() throws {
+        let targetDirectory = containerURL.appendingPathComponent("target-directory")
+        try FileManager.default.createDirectory(
+            at: targetDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let linkedRoot = containerURL.appendingPathComponent("linked-root")
+        try FileManager.default.createSymbolicLink(
+            at: linkedRoot,
+            withDestinationURL: targetDirectory
+        )
+        let linkedStore = try ConfigStore(rootURL: linkedRoot)
+
+        XCTAssertThrowsError(try linkedStore.getAliases())
+    }
+
+    func testRejectsNonRegularConfigEntry() throws {
+        try FileManager.default.createDirectory(
+            at: rootURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.createDirectory(
+            at: store.configFileURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        XCTAssertThrowsError(try store.getAliases())
+    }
+
+    func testRejectsExtendedACLOnConfigFile() throws {
+        try store.setAlias(name: "work", id: "CAL-1")
+
+        let chmod = Process()
+        chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        chmod.arguments = ["+a", "everyone allow read", store.configFileURL.path]
+        try chmod.run()
+        chmod.waitUntilExit()
+        XCTAssertEqual(chmod.terminationStatus, 0)
+
+        XCTAssertThrowsError(try store.getAliases()) { error in
+            guard case ConfigStoreError.unsafeEntry(_, let reason) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(reason.contains("extended ACL"))
+        }
+    }
+
+    func testAtomicWritesLeaveNoTemporaryFiles() throws {
+        try store.setAlias(name: "work", id: "CAL-1")
+        try store.setAlias(name: "home", id: "CAL-2")
+
+        let names = try FileManager.default.contentsOfDirectory(atPath: rootURL.path)
+        XCTAssertFalse(names.contains { $0.hasPrefix(".config.json.tmp.") })
+        XCTAssertEqual(try store.getAliases().count, 2)
+    }
+
+    // ── Validation and concurrency ───────────────────────────────────────────
+
+    func testRejectsInvalidAliasNamesAndIDs() {
+        for name in ["", " work", "work ", "work,home", "work\n"] {
+            XCTAssertThrowsError(try store.setAlias(name: name, id: "CAL-1"))
+        }
+        XCTAssertThrowsError(
+            try store.setAlias(name: String(repeating: "a", count: 129), id: "CAL-1"))
+
+        for id in ["", " CAL-1", "CAL-1 ", "CAL-1,CAL-2", "CAL\n1"] {
+            XCTAssertThrowsError(try store.setAlias(name: "work", id: id))
+        }
+        XCTAssertThrowsError(
+            try store.setAlias(name: "work", id: String(repeating: "a", count: 1_025)))
+    }
+
+    func testSideEffectFreeAliasValidationDoesNotCreateRoot() throws {
+        try ConfigManager.validateAlias(name: "work", id: "CAL-1")
+        try ConfigManager.validateAliasName("work")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.path))
+    }
+
+    func testConcurrentReadModifyWriteDoesNotLoseAliases() throws {
+        final class ErrorCollector: @unchecked Sendable {
+            private let lock = NSLock()
+            private(set) var errors: [Error] = []
+
+            func append(_ error: Error) {
+                lock.lock()
+                errors.append(error)
+                lock.unlock()
+            }
+        }
+
+        let errors = ErrorCollector()
+        let group = DispatchGroup()
+        let concurrentStore = try XCTUnwrap(store)
+        let queue = DispatchQueue(
+            label: "eventkitcontrol.config.concurrent-tests",
+            attributes: .concurrent
+        )
+
+        for index in 0..<50 {
+            group.enter()
+            queue.async {
+                defer { group.leave() }
+                do {
+                    try concurrentStore.setAlias(name: "alias-\(index)", id: "CAL-\(index)")
+                } catch {
+                    errors.append(error)
+                }
+            }
+        }
+
+        XCTAssertEqual(group.wait(timeout: .now() + 30), .success)
+        XCTAssertTrue(errors.errors.isEmpty, "\(errors.errors)")
+        let aliases = try store.getAliases()
+        XCTAssertEqual(aliases.count, 50)
+        for index in 0..<50 {
+            XCTAssertEqual(aliases["alias-\(index)"], "CAL-\(index)")
+        }
+    }
+
+    // ── Test helpers ─────────────────────────────────────────────────────────
+
+    private func configData(aliases: [String: String], version: Int) throws -> Data {
+        try JSONSerialization.data(
+            withJSONObject: ["aliases": aliases, "version": version],
+            options: [.sortedKeys]
+        )
+    }
+
+    private func writeConfigData(_ data: Data) throws {
+        if !FileManager.default.fileExists(atPath: rootURL.path) {
+            try FileManager.default.createDirectory(
+                at: rootURL,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        try data.write(to: store.configFileURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: store.configFileURL.path
+        )
+    }
+
+    private func permissions(of url: URL) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let permissions = attributes[.posixPermissions] as? NSNumber else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        return permissions.intValue
     }
 }
 
@@ -878,14 +1226,12 @@ final class AlarmParsingTests: XCTestCase {
         XCTAssertEqual(result, [-600, -3600])
     }
 
-    func testInvalidComponentsAreSkipped() {
-        let result = parseAlarms("abc,10")!
-        XCTAssertEqual(result, [-600])
+    func testInvalidComponentsRejectWholeList() {
+        XCTAssertNil(parseAlarms("abc,10"))
     }
 
-    func testEmptyStringReturnsEmptyArray() {
-        let result = parseAlarms("")!
-        XCTAssertTrue(result.isEmpty)
+    func testEmptyStringIsRejected() {
+        XCTAssertNil(parseAlarms(""))
     }
 }
 
@@ -938,7 +1284,7 @@ final class HexColorTests: XCTestCase {
 
 final class DateValidationTests: XCTestCase {
 
-    // ── Formats ekctl actually accepts ───────────────────────────────────────
+    // ── Formats eventkitcontrol actually accepts ─────────────────────────────
 
     func testUTCFormatIsAccepted() {
         XCTAssertNotNil(validateDate("2026-02-15T14:00:00Z"))
@@ -949,14 +1295,14 @@ final class DateValidationTests: XCTestCase {
         XCTAssertNotNil(validateDate("2026-02-15T14:00:00+08:00"))
     }
 
-    // ── Formats ekctl rejects ─────────────────────────────────────────────────
+    // ── Formats eventkitcontrol rejects ───────────────────────────────────────
 
     func testHumanReadableDateIsRejected() {
         XCTAssertNil(validateDate("March 5 2026"))
     }
 
     func testDateOnlyWithoutTimeIsRejected() {
-        // Missing time component — ekctl requires full ISO8601 datetime
+        // Missing time component — eventkitcontrol requires a full ISO8601 datetime
         XCTAssertNil(validateDate("2026-03-05"))
     }
 
@@ -969,40 +1315,6 @@ final class DateValidationTests: XCTestCase {
         XCTAssertNil(validateDate("05/03/2026"))
     }
 
-    // ── Travel time conversion ────────────────────────────────────────────────
-
-    func testTravelTimeConvertsMinutesToSeconds() {
-        // 20 min → 1200 seconds, stored via KVC travelTime property
-        XCTAssertEqual(travelTimeSeconds(from: "20"), 1200)
-    }
-
-    func testTravelTimeZeroMinutes() {
-        XCTAssertEqual(travelTimeSeconds(from: "0"), 0)
-    }
-
-    func testTravelTimeRejectsNonNumericInput() {
-        XCTAssertNil(travelTimeSeconds(from: "thirty"))
-    }
-
-    func testTravelTimeRejectsEmpty() {
-        XCTAssertNil(travelTimeSeconds(from: ""))
-    }
-
-    // ── Recurrence interval fallback ─────────────────────────────────────────
-
-    func testRecurrenceIntervalParsesValidInt() {
-        XCTAssertEqual(recurrenceInterval(from: "2"), 2)
-    }
-
-    func testRecurrenceIntervalDefaultsToOneWhenNil() {
-        // nil means --recurrence-interval was not passed
-        XCTAssertEqual(recurrenceInterval(from: nil), 1)
-    }
-
-    func testRecurrenceIntervalDefaultsToOneWhenInvalid() {
-        // Garbage input falls back to 1, not crash
-        XCTAssertEqual(recurrenceInterval(from: "fortnightly"), 1)
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1042,13 +1354,12 @@ final class UpdateReminderLogicTests: XCTestCase {
     // and this test catches it before release.
 
     func testInvalidDueDateProducesCorrectErrorMessage() {
-        let message = "Invalid --due date format. Use \(DateParsing.acceptedFormats)."
-        let output = JSONOutput.error(message)
+        let message = "Invalid --due. Use \(DateParsing.acceptedFormats)."
+        let output = JSONOutput.error(message, code: "invalid_input", exitCode: 64)
         let dict = output.toDictionary()
         XCTAssertEqual(dict["status"] as? String, "error")
         XCTAssertEqual(dict["error"] as? String, message)
-        // Scripts grep for the "Invalid --<flag> date format" prefix — keep it stable.
-        XCTAssertTrue(message.hasPrefix("Invalid --due date format."))
+        XCTAssertTrue(message.hasPrefix("Invalid --due."))
     }
 
     // ── Completed flag — tests the actual conditional logic ───────────────────
@@ -1126,8 +1437,7 @@ final class UpdateReminderLogicTests: XCTestCase {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Tests for `AvailabilitySetting` — the `--availability` value on
-/// `add event` / `update event`. Previously a raw String that was silently
-/// ignored when misspelled; now ArgumentParser rejects unknown values.
+/// `add event` / `update event`. ArgumentParser must reject unknown values.
 final class AvailabilitySettingTests: XCTestCase {
 
     func testParsesAllKnownValues() {
@@ -1138,7 +1448,7 @@ final class AvailabilitySettingTests: XCTestCase {
     }
 
     func testParsingIsCaseInsensitive() {
-        // The old string-based flag lowercased input; keep that leniency.
+        // Command values intentionally parse case-insensitively.
         XCTAssertEqual(AvailabilitySetting(argument: "BUSY"), .busy)
         XCTAssertEqual(AvailabilitySetting(argument: "Tentative"), .tentative)
     }
@@ -1161,9 +1471,9 @@ final class AvailabilitySettingTests: XCTestCase {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Tests for `TimeFormat` — the `--time-format` flag's rendering patterns
-/// (issue #3). `rfc3339` must stay byte-identical to the historical output;
-/// `compact` must always produce a numeric offset jq's `%z` can parse.
+/// Tests for the `--time-format` flag's rendering patterns. `rfc3339` uses a
+/// colon-separated offset or `Z`; `compact` always produces a numeric offset
+/// that jq's `%z` can parse.
 final class TimeFormatTests: XCTestCase {
 
     /// 2026-01-01T00:00:00Z rendered through `timeFormat` in `zone` — mirrors
@@ -1185,7 +1495,7 @@ final class TimeFormatTests: XCTestCase {
     }
 
     func testUTCRendering() {
-        // rfc3339 keeps the historical `Z`; compact must render `+0000`
+        // rfc3339 uses `Z`; compact must render `+0000`
         // because a literal `Z` is exactly what breaks jq's `%z`.
         XCTAssertEqual(render(.rfc3339, zone: "UTC"), "2026-01-01T00:00:00Z")
         XCTAssertEqual(render(.compact, zone: "UTC"), "2026-01-01T00:00:00+0000")
@@ -1206,7 +1516,7 @@ final class TimeFormatTests: XCTestCase {
                 let emitted = render(timeFormat, zone: zone)
                 XCTAssertNotNil(
                     DateParsing.parse(emitted),
-                    "\(timeFormat.rawValue) output \(emitted) must be valid ekctl input")
+                    "\(timeFormat.rawValue) output \(emitted) must be valid eventkitcontrol input")
             }
         }
     }
@@ -1215,11 +1525,11 @@ final class TimeFormatTests: XCTestCase {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Tests for `DateParsing.parse` — the shared parser behind every date-taking
-/// flag. The defining property (issue #3): anything ekctl can emit must parse
-/// back in, in both the colon (`+11:00`) and compact (`+1100`) offset forms.
+/// flag. Anything eventkitcontrol emits must parse back in, in both the colon
+/// (`+11:00`) and compact (`+1100`) offset forms.
 final class DateParsingTests: XCTestCase {
 
-    // ── Accepted: RFC 3339 / colon offsets (original behaviour) ──────────────
+    // ── Accepted: RFC 3339 / colon offsets ───────────────────────────────────
 
     func testParsesUTCZuluForm() {
         XCTAssertEqual(
@@ -1231,7 +1541,7 @@ final class DateParsingTests: XCTestCase {
         XCTAssertNotNil(DateParsing.parse("2026-03-09T16:00:00-04:00"))
     }
 
-    // ── Accepted: compact offsets (issue #3) ─────────────────────────────────
+    // ── Accepted: compact offsets ────────────────────────────────────────────
 
     func testParsesCompactOffset() {
         XCTAssertNotNil(DateParsing.parse("2026-03-09T16:00:00-0400"))
@@ -1260,7 +1570,7 @@ final class DateParsingTests: XCTestCase {
         XCTAssertNil(DateParsing.parse("2026-03-05"))  // date-only — no time
     }
 
-    // ── Round-trip: every form ekctl can emit is valid ekctl input ────────────
+    // ── Round-trip: every form eventkitcontrol emits remains valid input ──────
 
     func testEmittedFormatsRoundTrip() {
         // Mirror both timestamp renderings `localDateFormatter` can produce
