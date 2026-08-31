@@ -206,23 +206,45 @@ jobs:
                       result.append((match.group(1), match.group(2)))
               return result
 
-          applications = [
+          valid_applications = [
               (fingerprint, name)
               for fingerprint, name in identities(application_input)
               if name.startswith("Developer ID Application: ")
-              and name.endswith(f" ({team_id})")
           ]
-          installers = [
+          valid_installers = [
               (fingerprint, name)
               for fingerprint, name in identities(all_input)
               if name.startswith("Developer ID Installer: ")
-              and name.endswith(f" ({team_id})")
+          ]
+          applications = [
+              identity
+              for identity in valid_applications
+              if identity[1].endswith(f" ({team_id})")
+          ]
+          installers = [
+              identity
+              for identity in valid_installers
+              if identity[1].endswith(f" ({team_id})")
           ]
 
+          if valid_applications and not applications:
+              print(
+                  "error: APPLE_TEAM_ID does not match any valid "
+                  "Developer ID Application identity",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
           if len(applications) != 1:
               print(
                   f"error: expected exactly one valid Developer ID Application identity; "
                   f"found {len(applications)}",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          if valid_installers and not installers:
+              print(
+                  "error: APPLE_TEAM_ID does not match any valid "
+                  "Developer ID Installer identity",
                   file=sys.stderr,
               )
               raise SystemExit(1)

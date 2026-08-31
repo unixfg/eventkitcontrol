@@ -4,12 +4,14 @@ This file explains what changed, what users will notice, and why some behavior
 deliberately differs from the project this one began from. A version marked
 `Unreleased` has not yet been published.
 
-## 1.0.0 - 2026-08-31
+## 1.0.1 - 2026-08-31
 
-This is the first independent eventkitcontrol release. It began from
-[the original project's exact source commit][fork-point], but it now has its
-own command name, configuration, output, build, and release process. It does
-not promise compatibility with the original project.
+This is the first published independent eventkitcontrol release. A `v1.0.0`
+tag exists, but its workflow stopped before producing or publishing any release
+artifacts. The project began from [the original project's exact source
+commit][fork-point], but it now has its own command name, configuration,
+output, build, and release process. It does not promise compatibility with the
+original project.
 
 Most changes follow one rule: if the command cannot determine exactly what the
 user meant, or cannot verify that a change is safe, it stops before modifying
@@ -132,6 +134,9 @@ reconsidered on that basis.
   service, and include Apple's ticket for offline verification. A SHA-256
   checksum detects changed download bytes, while GitHub records which workflow
   and commit produced the files.
+- Signing credential validation distinguishes a Team ID mismatch from a missing
+  or unusable certificate, so a failed release points to the setting that needs
+  correction.
 
 ### Known limitations
 
@@ -147,5 +152,12 @@ reconsidered on that basis.
 - Attendees are read-only.
 - Reminder lists can be discovered and used, but not created, updated, or
   deleted.
+
+## 1.0.0 - 2026-08-31
+
+No release artifacts were published for this tag. Automation stopped during
+signing-credential validation before any release artifact was built or
+published. The tag remains unchanged as a record of that failed attempt;
+1.0.1 is the first published release.
 
 [fork-point]: https://github.com/unixfg/eventkitcontrol/commit/79a7c86124c04a93180ce2aeb281a5e3e483f88a
