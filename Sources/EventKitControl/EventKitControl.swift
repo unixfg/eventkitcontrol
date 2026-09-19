@@ -277,7 +277,7 @@ struct EventKitControl: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "eventkitcontrol",
         abstract: "Safely manage macOS Calendar events and Reminders using EventKit.",
-        version: "1.0.2",
+        version: "1.1.0",
         subcommands: [
             List.self, Show.self, Add.self, Update.self, Delete.self, Complete.self,
             Alias.self, CalendarCmd.self, Today.self, Tomorrow.self, Next.self, Free.self,

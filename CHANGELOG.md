@@ -4,7 +4,7 @@ This file explains what changed, what users will notice, and why some behavior
 deliberately differs from the project this one began from. A version marked
 `Unreleased` has not yet been published.
 
-## Unreleased
+## 1.1.0 - 2026-09-19
 
 - Added `free` to find available time across multiple event calendars, with
   working hours, weekday filters, minimum duration, buffers, start rounding,
