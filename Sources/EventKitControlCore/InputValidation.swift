@@ -74,7 +74,8 @@ public enum InputValidation {
         setPositions: String?,
         allDay: Bool,
         eventStart: Date,
-        timeZone: TimeZone
+        timeZone: TimeZone,
+        dateContext: DateInputContext? = nil
     ) throws -> ParsedRecurrence? {
         let anyOption = [interval, endCount, endDate, days, months, daysOfMonth,
                          weeksOfYear, daysOfYear, setPositions].contains { $0 != nil } || noEnd
@@ -122,9 +123,17 @@ public enum InputValidation {
                 }
                 parsedEndDate = nextDay.addingTimeInterval(-0.001)
             } else {
-                guard let date = DateParsing.parse(endDate) else {
+                let date: Date?
+                if let dateContext {
+                    date = dateContext.parse(endDate)
+                } else {
+                    date = DateParsing.parse(endDate)
+                }
+                guard let date else {
+                    let formats = dateContext == nil
+                        ? DateParsing.acceptedFormats : DateParsing.acceptedInputFormats
                     throw InputValidationError.message(
-                        "Timed recurrence end dates must use \(DateParsing.acceptedFormats).")
+                        "Timed recurrence end dates must use \(formats).")
                 }
                 parsedEndDate = date
             }

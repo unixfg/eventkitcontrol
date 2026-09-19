@@ -78,9 +78,20 @@ private func parseTimestamp(_ value: String, flag: String, format: OutputFormat)
     return date
 }
 
-private func parseLocalDay(_ value: String, flag: String, format: OutputFormat) throws -> Date {
+private func parseDateInput(
+    _ value: String, flag: String, format: OutputFormat, context: DateInputContext
+) throws -> Date {
+    guard let date = context.parse(value) else {
+        try invalid("Invalid \(flag). Use \(DateParsing.acceptedInputFormats).", format: format)
+    }
+    return date
+}
+
+private func parseLocalDay(
+    _ value: String, flag: String, format: OutputFormat, timeZone: TimeZone = .current
+) throws -> Date {
     guard let day = DateParsing.parseLocalDay(value),
-          let date = day.date(in: .current)
+          let date = day.date(in: timeZone)
     else {
         try invalid("Invalid \(flag). All-day values must use \(DateParsing.allDayFormat).", format: format)
     }
@@ -91,10 +102,13 @@ private func parseEventDate(
     _ value: String,
     flag: String,
     allDay: Bool,
-    format: OutputFormat
+    format: OutputFormat,
+    context: DateInputContext
 ) throws -> Date {
-    if allDay { return try parseLocalDay(value, flag: flag, format: format) }
-    return try parseTimestamp(value, flag: flag, format: format)
+    if allDay {
+        return try parseLocalDay(value, flag: flag, format: format, timeZone: context.timeZone)
+    }
+    return try parseDateInput(value, flag: flag, format: format, context: context)
 }
 
 private func parseSelectorDate(
@@ -266,7 +280,7 @@ struct EventKitControl: ParsableCommand {
         version: "1.0.2",
         subcommands: [
             List.self, Show.self, Add.self, Update.self, Delete.self, Complete.self,
-            Alias.self, CalendarCmd.self, Today.self, Tomorrow.self, Next.self,
+            Alias.self, CalendarCmd.self, Today.self, Tomorrow.self, Next.self, Free.self,
         ],
         defaultSubcommand: List.self
     )
@@ -350,16 +364,17 @@ struct ListEvents: ParsableCommand {
 
     @Option(name: .long, help: "Calendar ID or alias; comma-separate multiple values.")
     var calendar: String
-    @Option(name: .long, help: "Start in \(DateParsing.acceptedFormats).") var from: String
-    @Option(name: .long, help: "End in \(DateParsing.acceptedFormats).") var to: String
+    @Option(name: .long, help: "Start in \(DateParsing.acceptedInputFormats).") var from: String
+    @Option(name: .long, help: "End in \(DateParsing.acceptedInputFormats).") var to: String
     @Option(name: .long, help: "Case-insensitive title, location, and notes search.")
     var search: String?
     @Option(name: .long, help: "Availability filter.") var availability: AvailabilityFilter?
     @OptionGroup var outputFormat: OutputFormatOptions
 
     func run() throws {
-        let start = try parseTimestamp(from, flag: "--from", format: outputFormat.format)
-        let end = try parseTimestamp(to, flag: "--to", format: outputFormat.format)
+        let context = DateInputContext()
+        let start = try parseDateInput(from, flag: "--from", format: outputFormat.format, context: context)
+        let end = try parseDateInput(to, flag: "--to", format: outputFormat.format, context: context)
         guard end > start else {
             try invalid("--to must be later than --from.", format: outputFormat.format)
         }
@@ -459,8 +474,8 @@ struct AddEvent: ParsableCommand {
 
     @Option(name: .long, help: "Event-calendar ID or alias.") var calendar: String
     @Option(name: .long, help: "Event title.") var title: String
-    @Option(name: .long, help: "Timed timestamp, or YYYY-MM-DD with --all-day.") var start: String
-    @Option(name: .long, help: "Timed end, or exclusive YYYY-MM-DD boundary with --all-day.")
+    @Option(name: .long, help: "Timestamp or shorthand, or YYYY-MM-DD with --all-day.") var start: String
+    @Option(name: .long, help: "Timestamp or shorthand, or exclusive YYYY-MM-DD boundary with --all-day.")
     var end: String
     @Option(name: .long, help: "Location text.") var location: String?
     @Option(name: .long, help: "Notes.") var notes: String?
@@ -470,7 +485,7 @@ struct AddEvent: ParsableCommand {
     var recurrenceFrequency: String?
     @Option(name: .long, help: "Positive recurrence interval.") var recurrenceInterval: String?
     @Option(name: .long, help: "Positive occurrence count.") var recurrenceEndCount: String?
-    @Option(name: .long, help: "Strict timestamp, or YYYY-MM-DD for all-day events.")
+    @Option(name: .long, help: "Timestamp or shorthand, or YYYY-MM-DD for all-day events.")
     var recurrenceEndDate: String?
     @Flag(name: .long, help: "Explicitly create an unbounded recurrence.")
     var recurrenceNoEnd = false
@@ -504,10 +519,11 @@ struct AddEvent: ParsableCommand {
             try invalid("--geocode-location requires a non-empty --location.", format: outputFormat.format)
         }
         try validateURL(url, format: outputFormat.format)
+        let context = DateInputContext()
         let startDate = try parseEventDate(
-            start, flag: "--start", allDay: allDay, format: outputFormat.format)
+            start, flag: "--start", allDay: allDay, format: outputFormat.format, context: context)
         let endDate = try parseEventDate(
-            end, flag: "--end", allDay: allDay, format: outputFormat.format)
+            end, flag: "--end", allDay: allDay, format: outputFormat.format, context: context)
         try validateEventRange(
             start: startDate, end: endDate, allDay: allDay, format: outputFormat.format)
         let parsedAlarms = try parseAlarms(alarms, format: outputFormat.format)
@@ -527,7 +543,8 @@ struct AddEvent: ParsableCommand {
                 setPositions: recurrenceSetPositions,
                 allDay: allDay,
                 eventStart: startDate,
-                timeZone: .current)
+                timeZone: context.timeZone,
+                dateContext: context)
         } catch {
             try invalid(error.localizedDescription, format: outputFormat.format)
         }
@@ -572,7 +589,7 @@ struct AddReminder: ParsableCommand {
     static let configuration = CommandConfiguration(commandName: "reminder")
     @Option(name: .long, help: "Reminder-list ID or alias.") var list: String
     @Option(name: .long, help: "Reminder title.") var title: String
-    @Option(name: .long, help: "Due date in \(DateParsing.acceptedFormats).") var due: String?
+    @Option(name: .long, help: "Due date in \(DateParsing.acceptedInputFormats).") var due: String?
     @Option(name: .long, help: "One digit from 0 through 9.") var priority: String?
     @Option(name: .long, help: "Notes.") var notes: String?
     @OptionGroup var mutation: MutationOptions
@@ -582,8 +599,9 @@ struct AddReminder: ParsableCommand {
         guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             try invalid("--title must not be empty.", format: outputFormat.format)
         }
+        let context = DateInputContext()
         let dueDate = try due.map {
-            try parseTimestamp($0, flag: "--due", format: outputFormat.format)
+            try parseDateInput($0, flag: "--due", format: outputFormat.format, context: context)
         }
         let parsedPriority = try parsePriority(
             priority, default: 0, format: outputFormat.format) ?? 0
@@ -620,7 +638,7 @@ struct UpdateEvent: ParsableCommand {
     @Argument(help: "Event identifier.") var eventID: String
     @OptionGroup var occurrence: OccurrenceOptions
     @Option(name: .long) var title: String?
-    @Option(name: .long, help: "New timestamp, or YYYY-MM-DD when --all-day true.")
+    @Option(name: .long, help: "Timestamp or shorthand, or YYYY-MM-DD when --all-day true.")
     var start: String?
     @Option(name: .long, help: "New exclusive boundary; format follows --all-day.")
     var end: String?
@@ -664,12 +682,14 @@ struct UpdateEvent: ParsableCommand {
                 format: outputFormat.format)
         }
         try validateURL(url, format: outputFormat.format)
+        let context = DateInputContext()
         let startDate = try start.map {
             try parseEventDate(
-                $0, flag: "--start", allDay: allDay!, format: outputFormat.format)
+                $0, flag: "--start", allDay: allDay!, format: outputFormat.format, context: context)
         }
         let endDate = try end.map {
-            try parseEventDate($0, flag: "--end", allDay: allDay!, format: outputFormat.format)
+            try parseEventDate(
+                $0, flag: "--end", allDay: allDay!, format: outputFormat.format, context: context)
         }
         if let startDate, let endDate {
             try validateEventRange(
@@ -706,7 +726,7 @@ struct UpdateReminder: ParsableCommand {
     static let configuration = CommandConfiguration(commandName: "reminder")
     @Argument(help: "Reminder identifier.") var reminderID: String
     @Option(name: .long) var title: String?
-    @Option(name: .long, help: "New due date in \(DateParsing.acceptedFormats).") var due: String?
+    @Option(name: .long, help: "New due date in \(DateParsing.acceptedInputFormats).") var due: String?
     @Option(name: .long, help: "One digit from 0 through 9.") var priority: String?
     @Option(name: .long) var notes: String?
     @Option(name: .long) var completed: Bool?
@@ -721,8 +741,9 @@ struct UpdateReminder: ParsableCommand {
         guard title != nil || due != nil || priority != nil || notes != nil || completed != nil else {
             try invalid("No reminder changes were supplied.", format: outputFormat.format)
         }
+        let context = DateInputContext()
         let dueDate = try due.map {
-            try parseTimestamp($0, flag: "--due", format: outputFormat.format)
+            try parseDateInput($0, flag: "--due", format: outputFormat.format, context: context)
         }
         let parsedPriority = try parsePriority(priority, format: outputFormat.format)
         let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
@@ -1123,6 +1144,90 @@ struct Next: ParsableCommand {
                 availability: availability,
                 sortedByStartAscending: true,
                 limit: count),
+            format: outputFormat.format)
+    }
+}
+
+// MARK: - Free-time search
+
+struct Free: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "free",
+        abstract: "Find open time slots across event calendars.",
+        discussion: "Returns maximal gaps within working hours; --duration is the minimum gap length.")
+
+    @Option(name: .long, help: "Event-calendar IDs or aliases, separated by commas.")
+    var calendar: String
+    @Option(name: .long, help: "Minimum usable slot length in minutes.")
+    var duration = 30
+    @Option(name: .long, help: "Search start in \(DateParsing.acceptedInputFormats). Defaults to now.")
+    var from: String?
+    @Option(name: .long, help: "Search end in \(DateParsing.acceptedInputFormats). Defaults to --days after start.")
+    var to: String?
+    @Option(name: .long, help: "Lookahead when --to is omitted, between 1 and 1461 days.")
+    var days = 7
+    @Option(name: .long, help: "\(WorkingHours.acceptedFormats). Overnight windows are supported.")
+    var workingHours = "09:00-17:00"
+    @Option(name: .long, help: "\(Weekdays.acceptedFormats). Overnight windows belong to their opening day.")
+    var weekdays = "weekdays"
+    @Option(name: .long, help: "Minutes to leave before and after every busy event.")
+    var buffer = 0
+    @Option(name: .long, help: "Round starts up to a multiple of this many wall-clock minutes (0 disables; maximum 1440).")
+    var round = 0
+    @Option(name: .long, help: "Maximum number of slots returned.")
+    var limit = 20
+    @Flag(name: .long, help: "Ignore all-day events; otherwise their availability determines whether they block.")
+    var ignoreAllDay = false
+    @OptionGroup var outputFormat: OutputFormatOptions
+
+    func run() throws {
+        let context = DateInputContext()
+        guard (1...DateRanges.maximumNextWindowDays).contains(days) else {
+            try invalid(
+                "--days must be between 1 and \(DateRanges.maximumNextWindowDays).",
+                format: outputFormat.format)
+        }
+        guard let hours = WorkingHours.parse(workingHours) else {
+            try invalid("Invalid --working-hours. Use \(WorkingHours.acceptedFormats).", format: outputFormat.format)
+        }
+        guard let selectedWeekdays = Weekdays.parse(weekdays) else {
+            try invalid("Invalid --weekdays. Use \(Weekdays.acceptedFormats).", format: outputFormat.format)
+        }
+        let start = try from.map {
+            try parseDateInput($0, flag: "--from", format: outputFormat.format, context: context)
+        } ?? context.now
+        var localCalendar = Calendar(identifier: .gregorian)
+        localCalendar.timeZone = context.timeZone
+        let end: Date
+        if let to {
+            end = try parseDateInput(to, flag: "--to", format: outputFormat.format, context: context)
+        } else {
+            guard let range = DateRanges.nextWindow(now: start, days: days, calendar: localCalendar) else {
+                try invalid("--days could not be represented as a date range.", format: outputFormat.format)
+            }
+            end = range.end
+        }
+        let query: FreeBusyQuery
+        do {
+            query = try FreeBusyQuery(
+                from: start, to: end, workingHours: hours, weekdays: selectedWeekdays,
+                minimumDurationMinutes: duration, bufferMinutes: buffer,
+                roundToMinutes: round, limit: limit)
+        } catch {
+            try invalid(error.localizedDescription, format: outputFormat.format)
+        }
+        let calendarIDs: [String]
+        do {
+            calendarIDs = try ConfigManager.resolveCalendarIDs(calendar)
+        } catch {
+            try configFailed(error, context: "Could not read aliases", format: outputFormat.format)
+        }
+        try validateIdentifiers(calendarIDs, flag: "--calendar", format: outputFormat.format)
+        let manager = EventKitManager(timeFormat: outputFormat.timeFormat)
+        try requestAccess(manager, .events, format: outputFormat.format)
+        try emit(
+            manager.findFreeSlots(
+                calendarIDs: calendarIDs, query: query, ignoreAllDay: ignoreAllDay),
             format: outputFormat.format)
     }
 }

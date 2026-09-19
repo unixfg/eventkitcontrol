@@ -44,6 +44,7 @@ public struct LocalDay: Equatable, Hashable, Codable, CustomStringConvertible {
 public enum DateParsing {
     public static let acceptedFormats =
         "ISO 8601 (YYYY-MM-DDTHH:mm:ss[.fraction]Z, ±HH:MM, or ±HHMM)"
+    public static let acceptedInputFormats = acceptedFormats + ", " + RelativeDates.acceptedFormats
     public static let allDayFormat = "YYYY-MM-DD"
 
     private static let timestampRegex = try! NSRegularExpression(
