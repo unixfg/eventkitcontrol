@@ -19,6 +19,8 @@ reasoning behind intentional compatibility decisions.
 - Update or delete one recurring occurrence without accidentally targeting a
   different one
 - Quick date-range shortcuts: `today`, `tomorrow`, and `next`
+- Find free time across calendars with working hours, weekday filters, and meeting buffers
+- Shorthand date inputs such as `tomorrow 9am`, `fri 5pm`, and `+90m`
 - Search and filter (`--search`, `--availability busy`) without piping through jq
 - Calendar and reminder-list aliases (use friendly names instead of UUIDs)
 - JSON, CSV, or plain-text output (`--format json|csv|text`)
@@ -597,6 +599,57 @@ eventkitcontrol delete event EVENT_ID --yes
 }
 ```
 
+## Finding free time
+
+Free-time search and shorthand dates are available in the current source and
+are not included in the published v1.0.2 package.
+
+Find openings across one or more event calendars:
+
+```bash
+eventkitcontrol free --calendar work,personal --duration 60 --days 14 --buffer 15
+eventkitcontrol free --calendar work --from tomorrow --to +1w --round 15 --format text
+eventkitcontrol free --calendar personal --working-hours all --weekdays weekends --format csv
+```
+
+The command merges busy time across the selected calendars and returns the
+remaining gaps. `--duration` is the minimum acceptable length, not a fixed slot
+size: a two-hour opening remains one two-hour slot. Results are chronological.
+This command reads Calendar data and requests only Calendar permission.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--calendar` | Required | Comma-separated event-calendar IDs or aliases |
+| `--duration` | `30` | Minimum gap length in whole minutes |
+| `--from` | Now | Search start; accepts timestamps or shorthand |
+| `--to` | Start plus `--days` | Search end; accepts timestamps or shorthand |
+| `--days` | `7` | Lookahead when `--to` is omitted; 1–1461 days |
+| `--working-hours` | `09:00-17:00` | Daily window, `all`, or an overnight window such as `22:00-02:00` |
+| `--weekdays` | `weekdays` | Day names, ranges such as `mon-thu`, or `weekdays`, `weekends`, `all` |
+| `--buffer` | `0` | Minutes before and after each busy event |
+| `--round` | `0` | Round starts up to a wall-clock minute multiple, such as `15`; 0 disables, maximum 1440 |
+| `--limit` | `20` | Maximum number of returned gaps |
+| `--ignore-all-day` | Off | Exclude all-day events regardless of availability |
+
+Events marked free, cancelled events, and invitations you declined do not block
+time. Tentative, unavailable, and unknown availability block conservatively.
+All-day events follow the same rule unless `--ignore-all-day` is set. Overnight
+working windows belong to the day they open: Friday `22:00-02:00` includes early
+Saturday. Working hours follow local wall time across daylight-saving changes.
+
+Buffers also account for events immediately outside the requested range. A
+meeting ending at 08:55 with a 15-minute buffer blocks time until 09:10, even
+when the search begins at 09:00. The complete fetch, including both buffer
+edges, must fit within 1461 days; shorten a maximum-length search when adding a
+buffer. Empty, missing, or reminder-list calendar selections produce an error.
+
+JSON contains `slots`, `count`, `minimumDurationMinutes`, `searchedFrom`,
+`searchedTo`, `workingHours`, `weekdays`, `bufferMinutes`, `roundToMinutes`,
+`ignoreAllDay`, and `busyEventCount`. Each slot contains `startDate`, `endDate`,
+`durationMinutes`, `date`, and `weekday`. `busyEventCount` counts blocking events
+in the buffer-expanded fetch. CSV and text render one row per slot, and
+`--time-format` controls timestamp output as it does for events.
+
 ## Reminders
 
 ### List Reminders
@@ -782,9 +835,11 @@ eventkitcontrol delete reminder REMINDER_ID --yes
 
 ## Date Format
 
-Timed date inputs accept strict **ISO 8601** timestamps in these forms. The
-entire value is consumed; invalid calendar days, trailing text, and impossible
-offsets are rejected:
+Date flags for event searches, free-time searches, timed event start/end,
+reminder due dates, and timed recurrence end dates accept **ISO 8601** timestamps
+or the shorthand forms below. ISO input remains strict: the entire value is
+consumed; invalid calendar days, trailing text, and impossible offsets are
+rejected.
 
 | Format | Example | Description |
 | -------- | --------- | ------------- |
@@ -792,6 +847,42 @@ offsets are rejected:
 | Offset with colon | `2026-01-15T09:00:00+10:00` | 9:00 AM AEST (RFC 3339) |
 | Compact offset | `2026-01-15T09:00:00+1000` | Same instant, jq-style `%z` form |
 | Fractional seconds | `2026-01-15T09:00:00.123456789Z` | One through nine fractional digits |
+
+Shorthand uses the local time zone and Gregorian calendar. Every date flag in
+one invocation shares the same captured current instant:
+
+| Form | Meaning |
+| --- | --- |
+| `now`, `+90m`, `-2h`, `+3d`, `+1w` | Current instant or an offset from it; minutes, hours, days, weeks |
+| `today`, `tomorrow`, `yesterday` | Start of the named local day |
+| `fri`, `friday` | Next matching weekday, including today |
+| `next fri`, `last fri` | Next or previous matching weekday, excluding today |
+| `next week`, `last week` | Start of the day seven days ahead or behind |
+| `2026-10-01` | Start of that Gregorian local date |
+| `14:30`, `3pm`, `9:15am`, `noon`, `midnight` | That time today |
+| `tomorrow 3pm`, `next fri at 09:00` | Named day with a local wall-clock time |
+
+```bash
+eventkitcontrol add event --calendar work --title Standup \
+  --start "tomorrow 9am" --end "tomorrow 9:15am" --dry-run
+eventkitcontrol add reminder --list personal --title "Call the dentist" --due "fri 5pm" --dry-run
+eventkitcontrol list events --calendar work --from=-2h --to +1w
+```
+
+Use the `=` form for negative offsets so they are not read as flags. Offsets
+are relative to now, including `--end +1h`; they are not relative to another
+flag. Day and week offsets preserve local wall time, while minute and hour
+offsets measure elapsed time. Bare days mean midnight (or the first valid
+instant on a day without midnight); they do not create an all-day event. A bare
+number such as `9` is rejected. Month/year offsets are unsupported, and `m`
+always means minutes.
+
+Nonexistent or ambiguous shorthand times during daylight-saving transitions
+are rejected. Supply an ISO timestamp with an explicit offset to select a
+specific instant. Exact recurring-event selectors (`--occurrence` and
+`--expected-start`) still require copied timestamps or `YYYY-MM-DD` values;
+they never accept shorthand. All-day start/end and recurrence end dates still
+require `YYYY-MM-DD`.
 
 Timestamps in **output** are rendered in your local timezone and are always valid input, so values round-trip between commands. The rendering is controlled by `--time-format` on every command:
 
@@ -984,7 +1075,7 @@ Common errors:
 
 - `Permission denied`: Grant access in System Settings → Privacy & Security → Calendars/Reminders
 - `Event calendar not found`: Check the calendar ID with `eventkitcontrol list calendars`
-- `Invalid date format`: Use ISO 8601 (e.g., `2026-01-15T09:00:00Z`, `+10:00`, or `+1000` offsets — see [Date Format](#date-format))
+- `Invalid date format`: Use a supported timestamp or shorthand; exact occurrence selectors and all-day values have stricter rules — see [Date Format](#date-format).
 
 Exit codes: `0` success, `1` failure, `2` permission denied, `64` invalid usage (bad flags/values).
 

@@ -458,6 +458,103 @@ public class EventKitManager {
         return JSONOutput.success(["events": eventDicts, "count": eventDicts.count])
     }
 
+    /// Finds free time without changing Calendar data. The validated query
+    /// widens the fetch by its buffer so events outside the visible range can
+    /// still block slots at either boundary.
+    public func findFreeSlots(
+        calendarIDs: [String],
+        query: FreeBusyQuery,
+        ignoreAllDay: Bool = false
+    ) -> JSONOutput {
+        guard !calendarIDs.isEmpty else {
+            return JSONOutput.error(
+                "At least one event calendar is required.", code: "invalid_input", exitCode: 64)
+        }
+        let calendars: [EKCalendar]
+        do {
+            // Event-only discovery never treats a reminder list as an empty,
+            // entirely free calendar, and never requests Reminders access.
+            calendars = try Set(calendarIDs).sorted().map { id in
+                _ = try InputValidation.validateIdentifier(id)
+                return try eventCalendar(withIdentifier: id)
+            }
+        } catch let error as InputValidationError {
+            return JSONOutput.error(error.localizedDescription, code: "invalid_input", exitCode: 64)
+        } catch {
+            return eventKitFailureOutput(error)
+        }
+        let predicate = eventStore.predicateForEvents(
+            withStart: query.fetchStart, end: query.fetchEnd, calendars: calendars)
+        var busy: [TimeSlot] = []
+        for event in eventStore.events(matching: predicate) {
+            guard Self.blocksTime(event, ignoreAllDay: ignoreAllDay) else { continue }
+            guard let start = event.startDate, let end = event.endDate,
+                  start.timeIntervalSinceReferenceDate.isFinite,
+                  end.timeIntervalSinceReferenceDate.isFinite, start <= end
+            else {
+                return JSONOutput.error(
+                    "A busy event has invalid dates; free time could not be determined.")
+            }
+            busy.append(TimeSlot(start: start, end: end))
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let slots = FreeBusy.slots(busy: busy, query: query, calendar: calendar)
+        return freeSlotsOutput(
+            slots: slots, query: query, busyEventCount: busy.count, ignoreAllDay: ignoreAllDay)
+    }
+
+    /// EventKit availability is authoritative; unknown availability blocks
+    /// conservatively. Cancelled events and declined invitations do not block.
+    public static func blocksTime(
+        availability: EKEventAvailability,
+        isAllDay: Bool,
+        status: EKEventStatus,
+        currentUserDeclined: Bool,
+        ignoreAllDay: Bool
+    ) -> Bool {
+        if ignoreAllDay && isAllDay { return false }
+        return availability != .free && status != .canceled && !currentUserDeclined
+    }
+
+    private static func blocksTime(_ event: EKEvent, ignoreAllDay: Bool) -> Bool {
+        let declined = event.attendees?.contains {
+            $0.isCurrentUser && $0.participantStatus == .declined
+        } ?? false
+        return blocksTime(
+            availability: event.availability, isAllDay: event.isAllDay,
+            status: event.status, currentUserDeclined: declined, ignoreAllDay: ignoreAllDay)
+    }
+
+    func freeSlotsOutput(
+        slots: [TimeSlot], query: FreeBusyQuery, busyEventCount: Int, ignoreAllDay: Bool
+    ) -> JSONOutput {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let rows: [[String: Any]] = slots.map { slot in
+            [
+                "startDate": localDateFormatter.string(from: slot.start),
+                "endDate": localDateFormatter.string(from: slot.end),
+                "durationMinutes": slot.durationMinutes,
+                "date": dateOnlyFormatter.string(from: slot.start),
+                "weekday": Weekdays.name(for: calendar.component(.weekday, from: slot.start)),
+            ]
+        }
+        return JSONOutput.success([
+            "slots": rows,
+            "count": rows.count,
+            "minimumDurationMinutes": query.minimumDurationMinutes,
+            "searchedFrom": localDateFormatter.string(from: query.from),
+            "searchedTo": localDateFormatter.string(from: query.to),
+            "workingHours": query.workingHours.formatted,
+            "weekdays": Weekdays.formatted(query.weekdays),
+            "bufferMinutes": query.bufferMinutes,
+            "roundToMinutes": query.roundToMinutes,
+            "ignoreAllDay": ignoreAllDay,
+            "busyEventCount": busyEventCount,
+        ])
+    }
+
     /// Single source of truth for mapping EKEventAvailability to its public string
     /// form. Used by both `eventToDict` (for output) and `listEvents` (for filtering
     /// against `AvailabilityFilter`) so the two paths can't drift apart.

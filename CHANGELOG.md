@@ -4,6 +4,24 @@ This file explains what changed, what users will notice, and why some behavior
 deliberately differs from the project this one began from. A version marked
 `Unreleased` has not yet been published.
 
+## Unreleased
+
+- Added `free` to find available time across multiple event calendars, with
+  working hours, weekday filters, minimum duration, buffers, start rounding,
+  result limits, and JSON/CSV/text output. The search includes neighboring
+  events whose buffers overlap the requested range and bounds the complete
+  fetch to 1461 days. Calendar selection fails closed; reminder lists cannot
+  be mistaken for entirely free calendars.
+- Added shorthand dates such as `tomorrow 9am`, `fri 5pm`, and `+90m` to search
+  boundaries, timed event start/end, reminder due dates, and timed recurrence
+  end dates. A command captures one current instant and local time zone for
+  all its inputs. Strict ISO validation, exact recurring-occurrence selectors,
+  and date-only all-day boundaries are preserved. Ambiguous or nonexistent
+  shorthand wall times are rejected instead of silently shifted.
+- Ported the original project's free-time and shorthand-date features through
+  source commit `8ec00a150bff04f64ccfa39aaf87c07ce33e3064`, including its DST
+  and Gregorian-date fixes, with additional boundary and validation tests.
+
 ## 1.0.2 - 2026-08-31
 
 This entry describes the complete scope of eventkitcontrol's initial
