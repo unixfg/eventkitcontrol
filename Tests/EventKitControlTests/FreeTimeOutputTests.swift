@@ -91,7 +91,7 @@ final class FreeTimeOutputTests: XCTestCase {
                     TimeSlot(start: end.addingTimeInterval(-1800), end: end)],
             query: try query(), busyEventCount: 1, ignoreAllDay: false)
         let csv = output.format(.csv)
-        XCTAssertEqual(csv.split(separator: "\n").count, 3)
+        XCTAssertEqual(csv.components(separatedBy: "\r\n").count, 3)
         XCTAssertTrue(csv.contains("durationMinutes"))
         XCTAssertTrue(csv.contains("startDate"))
         XCTAssertFalse(csv.contains("slots"))

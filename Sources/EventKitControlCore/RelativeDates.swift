@@ -313,17 +313,41 @@ public enum RelativeDates {
         components.hour = minutes / 60
         components.minute = minutes % 60
         components.second = second
-        let beforeDay = calendar.startOfDay(for: day).addingTimeInterval(-1)
-        guard let first = calendar.nextDate(
-            after: beforeDay, matching: components, matchingPolicy: .strict,
-            repeatedTimePolicy: .first, direction: .forward),
-              let last = calendar.nextDate(
-                after: beforeDay, matching: components, matchingPolicy: .strict,
-                repeatedTimePolicy: .last, direction: .forward),
-              first == last,
-              calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: first)
-                == components
-        else { return nil }
-        return first
+        // Calendar's repeated-time policies do not reliably distinguish both
+        // sides of a half-hour transition. Instead, try each actual UTC offset
+        // near this local day and require exactly one complete round trip.
+        var utc = calendar
+        utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        guard let civilClock = utc.date(from: components) else { return nil }
+        let lower = civilClock.addingTimeInterval(-48 * 3600)
+        let upper = civilClock.addingTimeInterval(48 * 3600)
+        let zone = calendar.timeZone
+        var offsets: Set<Int> = [
+            zone.secondsFromGMT(for: lower),
+            zone.secondsFromGMT(for: civilClock),
+            zone.secondsFromGMT(for: upper),
+        ]
+        var cursor = lower
+        var transitions = 0
+        while let transition = zone.nextDaylightSavingTimeTransition(after: cursor),
+              transition <= upper {
+            // Fail closed if timezone data does not advance or unexpectedly
+            // contains an excessive number of transitions in this four-day span.
+            guard transition > cursor, transitions < 16 else { return nil }
+            offsets.insert(zone.secondsFromGMT(for: transition.addingTimeInterval(-1)))
+            offsets.insert(zone.secondsFromGMT(for: transition))
+            cursor = transition
+            transitions += 1
+        }
+
+        var candidates = Set<Date>()
+        for offset in offsets {
+            let candidate = civilClock.addingTimeInterval(-Double(offset))
+            if calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: candidate)
+                == components {
+                candidates.insert(candidate)
+            }
+        }
+        return candidates.count == 1 ? candidates.first : nil
     }
 }

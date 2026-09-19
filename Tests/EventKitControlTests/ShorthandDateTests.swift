@@ -308,9 +308,10 @@ final class DateParsingShorthandIntegrationTests: XCTestCase {
             let viaShorthandAwareParser = DateInputContext(now: fixedNow()).parse(iso)
             XCTAssertNotNil(viaShorthandAwareParser, "should still parse: \(iso)")
 
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let strict = formatter.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+            // Preserve this project's strict timestamp parser exactly, including
+            // fractional precision beyond ISO8601DateFormatter's rounding.
+            let strict = DateParsing.parse(iso)
+            XCTAssertNotNil(strict)
             XCTAssertEqual(viaShorthandAwareParser, strict, "instant changed for: \(iso)")
         }
     }
@@ -440,9 +441,28 @@ final class ShorthandSafetyTests: XCTestCase {
             now: DateParsing.parse("2026-04-01T00:00:00Z")!,
             timeZone: TimeZone(identifier: "Australia/Lord_Howe")!)
         XCTAssertNil(context.parse("2026-04-05 01:45"))
+        XCTAssertNil(context.parse("2026-04-05 01:30"))
+        XCTAssertNil(context.parse("2026-04-05 01:59"))
         XCTAssertNil(context.parse("2026-10-04 02:15"))
+        XCTAssertNil(context.parse("2026-10-04 02:00"))
+        XCTAssertNil(context.parse("2026-10-04 02:29"))
+        XCTAssertEqual(context.parse("2026-04-05 01:29"),
+                       DateParsing.parse("2026-04-05T01:29:00+11:00"))
+        XCTAssertEqual(context.parse("2026-04-05 02:00"),
+                       DateParsing.parse("2026-04-05T02:00:00+10:30"))
         XCTAssertEqual(context.parse("2026-10-04 02:30"),
                        DateParsing.parse("2026-10-04T02:30:00+11:00"))
+    }
+
+    func testPoliticalOffsetChangeWithoutDSTIsAlsoStrict() {
+        let context = DateInputContext(
+            now: DateParsing.parse("2014-10-01T00:00:00Z")!,
+            timeZone: TimeZone(identifier: "Europe/Moscow")!)
+        XCTAssertNil(context.parse("2014-10-26 01:30"))
+        XCTAssertEqual(context.parse("2014-10-26 00:30"),
+                       DateParsing.parse("2014-10-26T00:30:00+04:00"))
+        XCTAssertEqual(context.parse("2014-10-26 02:30"),
+                       DateParsing.parse("2014-10-26T02:30:00+03:00"))
     }
 
     func testSkippedCivilDateIsRejected() {
