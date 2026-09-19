@@ -1,0 +1,4 @@
+interface:
+  display_name: "eventkitcontrol"
+  short_description: "Manage Apple Calendar events and Reminders"
+  default_prompt: "Use $eventkitcontrol to show today’s events from my work calendar."
