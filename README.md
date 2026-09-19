@@ -49,7 +49,7 @@ changes on Intel Macs or macOS older than 14. Replace the tag below with the
 release you want:
 
 ```bash
-TAG=v1.0.2
+TAG=v1.1.0
 PACKAGE="eventkitcontrol-${TAG}-macos-arm64.pkg"
 curl -fLO "https://github.com/unixfg/eventkitcontrol/releases/download/${TAG}/${PACKAGE}"
 curl -fLO "https://github.com/unixfg/eventkitcontrol/releases/download/${TAG}/${PACKAGE}.sha256"
@@ -601,8 +601,7 @@ eventkitcontrol delete event EVENT_ID --yes
 
 ## Finding free time
 
-Free-time search and shorthand dates are available in the current source and
-are not included in the published v1.0.2 package.
+Free-time search and shorthand dates require v1.1.0 or later.
 
 Find openings across one or more event calendars:
 
