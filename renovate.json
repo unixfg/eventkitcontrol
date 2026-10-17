@@ -1,0 +1,83 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "timezone": "America/Chicago",
+  "schedule": [
+    "* 0-11 * * *"
+  ],
+  "updateNotScheduled": false,
+  "automerge": false,
+  "automergeType": "pr",
+  "automergeStrategy": "merge-commit",
+  "platformAutomerge": true,
+  "rebaseWhen": "conflicted",
+  "ignoreTests": false,
+  "internalChecksFilter": "strict",
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 2,
+  "labels": [
+    "dependencies"
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "addLabels": [
+      "security"
+    ],
+    "schedule": [],
+    "minimumReleaseAge": null,
+    "updateNotScheduled": true,
+    "groupName": null
+  },
+  "packageRules": [
+    {
+      "description": "Group routine GitHub Actions updates",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest",
+        "patch",
+        "minor"
+      ],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Auto-merge routine updates after required CI passes",
+      "matchUpdateTypes": [
+        "patch",
+        "minor",
+        "digest",
+        "pinDigest"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Keep major updates separate and require manual merging",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": null,
+      "automerge": false,
+      "addLabels": [
+        "major-update"
+      ]
+    }
+  ],
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "**/vendor/**",
+    "**/fixtures/**",
+    "tmp/**"
+  ],
+  "forkProcessing": "enabled",
+  "enabledManagers": [
+    "swift",
+    "github-actions"
+  ]
+}

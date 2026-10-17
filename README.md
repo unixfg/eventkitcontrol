@@ -1090,6 +1090,15 @@ eventkitcontrol add event --help
 
 [MIT](LICENSE)
 
+## Dependency updates
+
+Renovate manages Swift packages and GitHub Actions in this fork. Routine updates
+run from midnight until noon in `America/Chicago`, with at most two ordinary
+update PRs open at once. Patch, minor, and digest updates use GitHub auto-merge
+after the required repository policy and macOS Swift checks pass. Major updates
+require a manual merge. Security updates bypass the daily window and retain
+the same checks and manual-major rule.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development checks, focused
